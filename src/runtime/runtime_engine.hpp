@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 
@@ -47,7 +48,7 @@ private:
 
 class RuntimeEngine {
 public:
-    void run();
+    void run(volatile sig_atomic_t& running);
 
 private:
     ShmManager shm_;

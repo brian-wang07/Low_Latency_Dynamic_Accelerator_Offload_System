@@ -36,7 +36,7 @@ void TickProcessor::on_tick(const CachedTick& tick) {
     }
 }
 
-void RuntimeEngine::run() {
+void RuntimeEngine::run(volatile sig_atomic_t& running) {
     std::cout << "Waiting for shared memory...\n";
     while (!shm_.open()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -46,7 +46,7 @@ void RuntimeEngine::run() {
     auto* block = shm_.as<engine::shm::SharedMemoryBlock>();
     uint64_t last_seen_seq = 0;
 
-    while (true) {
+    while (running) {
         uint64_t seq = block->latest_market_data.sequence_number.load(std::memory_order_acquire);
         if (seq == last_seen_seq) {
             _mm_pause();

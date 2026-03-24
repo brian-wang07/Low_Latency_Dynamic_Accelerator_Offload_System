@@ -1,4 +1,5 @@
 #include <chrono>
+#include <csignal>
 #include <iostream>
 #include <thread>
 
@@ -6,10 +7,14 @@
 #include "../common/shm_types.hpp"
 #include "data_generator.hpp"
 
-///Shared memory manager implementation. The manager is to be owned by the data generator, 
-///as it is the first thing that gets created that uses the shared memory.
+static volatile sig_atomic_t g_running = 1;
+static void handle_signal(int) { g_running = 0; }
 
 int main() {
+  struct sigaction sa{};
+  sa.sa_handler = handle_signal;
+  sigaction(SIGINT,  &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
   ShmManager shm;
   DataGeneratorConfig cfg{
       .base_interval_ns = 100'000,          // 0.1 ms
@@ -29,7 +34,7 @@ int main() {
     DataGenerator generator(cfg);
     using clock = std::chrono::steady_clock;
     auto next_time = clock::now();
-    while (1) {
+    while (g_running) {
 
       auto tick = generator.next();
 
@@ -56,7 +61,7 @@ int main() {
 
 
       // hybrid wait
-      while (1) {
+      while (g_running) {
           auto now = clock::now();
           if (now >= next_time) break;
 
