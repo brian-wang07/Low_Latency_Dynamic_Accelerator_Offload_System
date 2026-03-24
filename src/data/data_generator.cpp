@@ -5,12 +5,12 @@
 
 #include "data_generator.hpp"
 
-//TODO: Implement bid/ask, limit/market, order type via mean reverting lognormal dist. derive mid
-
 DataGenerator::DataGenerator(DataGeneratorConfig cfg) :
     cfg_(std::move(cfg)),
     rng_(cfg_.seed),
-    current_price_(cfg_.start_price) {}
+    current_price_(cfg_.start_price),
+    current_spread_(cfg_.start_spread),
+    depth_dist_(cfg_.depth_log_mean, cfg_.depth_log_sigma) {}
 
 
 GeneratedTick DataGenerator::next() {
@@ -44,28 +44,54 @@ GeneratedTick DataGenerator::next() {
     double wait_multiplier = log_dist(rng_);
     uint64_t actual_wait_ns = std::max<uint64_t>(current_interval * wait_multiplier, 1);
 
-
     double time_scaling = std::sqrt(static_cast<double>(actual_wait_ns) / static_cast<double>(current_interval));
-    double price_change = dist_(rng_) * current_volatility * time_scaling;
+    double dt           = time_scaling * time_scaling;
+    double dW           = dist_(rng_) * time_scaling;
 
-    current_price_ += price_change;
+    // convert absolute volatility (dollar terms) to fractional for GBM
+    // use start_price (not current_price_) to avoid state-dependent volatility feedback loop:
+    // if price drops → frac_vol rises → variance rises → price drops further → NaN
+    double frac_vol     = current_volatility / cfg_.start_price;
+    double log_return   = (cfg_.drift - 0.5 * frac_vol * frac_vol) * dt
+                        + frac_vol * dW;
+    current_price_     *= std::exp(log_return);
 
-    current_price_ = std::max(current_price_, 0.01);
+    // spread: OU mean-reversion + independent noise, floored at min_spread
+    double dW2           = dist_(rng_) * time_scaling;
+    double spread_change = cfg_.spread_reversion_speed * (cfg_.spread_mean - current_spread_) * dt
+                         + cfg_.spread_volatility * dW2;
+    current_spread_ = std::max(current_spread_ + spread_change, cfg_.min_spread);
 
+    double bid = current_price_ - current_spread_ / 2.0;
+    double ask = current_price_ + current_spread_ / 2.0;
+
+    uint32_t    depth      = std::max(1u, static_cast<uint32_t>(std::lround(depth_dist_(rng_))));
+    Side        side       = uniform_(rng_) < cfg_.prob_bid   ? Side::BID    : Side::ASK;
+    OrderType   order_type = uniform_(rng_) < cfg_.prob_limit ? OrderType::LIMIT : OrderType::MARKET;
+    double      u          = uniform_(rng_);
+    OrderAction action     = u < cfg_.prob_new                    ? OrderAction::NEW
+                           : u < cfg_.prob_new + cfg_.prob_cancel ? OrderAction::CANCEL
+                                                                   : OrderAction::MODIFY;
 
     uint64_t timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()
     ).count();
 
     MarketDataSnapshot data {
-        .sequence_number = ++sequence_, 
-        .price = current_price_,
-        .timestamp = timestamp
+        .sequence_number = ++sequence_,
+        .bid        = bid,
+        .ask        = ask,
+        .depth      = depth,
+        .price      = current_price_,
+        .order_type = order_type,
+        .side       = side,
+        .action     = action,
+        .timestamp  = timestamp
     };
 
     return GeneratedTick {
-        .data = data,
-        .wait_ns = actual_wait_ns,
+        .data     = data,
+        .wait_ns  = actual_wait_ns,
         .in_burst = in_burst_
     };
 }
