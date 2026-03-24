@@ -35,7 +35,7 @@ int main() {
       .spread_volatility      = 0.02,
       .min_spread             = 0.01,
       .start_spread           = 0.10,
-      .depth_log_mean         = 5,
+      .depth_log_mean         = 500,
       .depth_log_sigma        = 1,
       .prob_limit             = 0.70,
       .prob_bid               = 0.50,

@@ -10,7 +10,7 @@ DataGenerator::DataGenerator(DataGeneratorConfig cfg) :
     rng_(cfg_.seed),
     current_price_(cfg_.start_price),
     current_spread_(cfg_.start_spread),
-    depth_dist_(cfg_.depth_log_mean, cfg_.depth_log_sigma) {}
+    depth_dist_(std::log(cfg_.depth_log_mean), cfg_.depth_log_sigma) {}
 
 
 GeneratedTick DataGenerator::next() {
