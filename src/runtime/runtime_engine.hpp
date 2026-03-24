@@ -6,7 +6,6 @@
 #include <cstdint>
 
 #include "shm_manager.hpp"
-#include "shm_types.hpp"
 
 struct CachedTick {
     uint64_t sequence_number;

@@ -1,3 +1,4 @@
+#include <iostream>
 #include <string>
 
 #include <sys/mman.h> //shm 
@@ -46,6 +47,7 @@ bool ShmManager::create() {
   is_valid_ = true;
   size_ = engine::shm::SHM_SIZE;
   std::memset(addr_, 0, size_);
+  engine::shm::shm_init_header(static_cast<engine::shm::SharedMemoryBlock*>(addr_));
   return true;
 }
 
@@ -68,11 +70,23 @@ bool ShmManager::open() {
     return false;
   }
   
+  auto* block = static_cast<engine::shm::SharedMemoryBlock*>(p);
+  if (!engine::shm::shm_validate_header(block)) {
+      std::cerr << "shm_open: layout mismatch (magic=" << block->header.magic
+                << " version=" << block->header.version
+                << "), expected magic=" << engine::shm::SHM_MAGIC
+                << " version=" << engine::shm::SHM_VERSION << '\n';
+      munmap(p, engine::shm::SHM_SIZE);
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+  }
+
   addr_ = p;
   owner_ = false;
   is_valid_ = true;
   size_ = engine::shm::SHM_SIZE;
-  return true;  
+  return true;
 }
 
 void ShmManager::close() {

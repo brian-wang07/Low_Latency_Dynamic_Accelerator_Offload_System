@@ -11,6 +11,8 @@ static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
 
 int main() {
+  //catch potential ctrl c / explicit sigint and sigterm syscalls, to ensure that raii destructor is explicitly called.
+  //if this doesnt work, just do rm dev/shm/engine_shm_mvp
   struct sigaction sa{};
   sa.sa_handler = handle_signal;
   sigaction(SIGINT,  &sa, nullptr);
