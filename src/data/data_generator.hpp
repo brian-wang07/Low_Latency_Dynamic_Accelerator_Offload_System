@@ -1,91 +1,80 @@
 #pragma once
 
+// Generative model for synthetic order event streams.
+// Maintains an internal book (price-level depth + live order map) for cancel
+// selection, market-order matching, and price-impact computation.
+// BBO is derived from the OU mid + CIR spread, not from the book.
 
-#include <cstdint>
-#include <cstddef>
 #include <random>
+#include <vector>
+#include <deque>
+#include <map>
+#include <unordered_map>
+#include <queue>
 
-enum class OrderType : uint8_t {
-    LIMIT  = 0,
-    MARKET = 1,
+#include "config.hpp"
+
+struct LiveOrder {
+    uint64_t order_id;
+    Side     side;
+    int64_t  price;
+    int64_t  qty;
+    double   expiry_time;
 };
 
-enum class Side : uint8_t {
-    BID = 0,
-    ASK = 1,
+struct ExpiryEntry {
+    double   expiry_time;
+    uint64_t order_id;
+    bool operator>(const ExpiryEntry& o) const { return expiry_time > o.expiry_time; }
 };
 
-enum class OrderAction: uint8_t {
-    NEW    = 0,
-    CANCEL = 1,
-    MODIFY = 2,
-};
-
-struct MarketDataSnapshot {
-    uint64_t    sequence_number;
-    double      bid; //best bid
-    double      ask; //best ask
-    uint32_t    depth;
-    double      price;
-    OrderType   order_type;
-    Side        side;
-    OrderAction action;
-    uint64_t    timestamp;
-
-};
-
-
-struct GeneratedTick {
-    MarketDataSnapshot data;
-    uint64_t wait_ns;
-    bool in_burst;
-};
-
-struct DataGeneratorConfig {
-    std::uint64_t base_interval_ns;
-    std::uint64_t burst_interval_ns;
-    std::size_t   burst_length;
-    double        start_price;
-    double        volatility;
-    double        drift;         // annualized drift for mid GBM (e.g. 2e-6 ≈ +1 per 5000 ticks at price 100)
-    double        burst_probability;
-    double        burst_volatility_multiplier;
-    std::uint64_t seed;
-    double        jitter_sigma;
-    bool          enable_bursts;
-
-    double        spread_mean;
-    double        spread_reversion_speed;
-    double        spread_volatility;
-    double        min_spread;
-    double        start_spread;
-
-    double        depth_log_mean;
-    double        depth_log_sigma;
-
-    double        prob_limit; // P(LIMIT), rest MARKET
-    double        prob_bid; // P(BID), rest ASK
-    double        prob_new; // P(NEW)
-    double        prob_cancel; // P(CANCEL), rest MODIFY
-};
-
-///generates next tick. seperate from shm
 class DataGenerator {
 public:
     explicit DataGenerator(DataGeneratorConfig cfg);
-    GeneratedTick next();
+    GeneratedEvent next();
 
 private:
     DataGeneratorConfig cfg_;
     std::mt19937_64 rng_;
-
-    std::uint64_t sequence_ = 0;
-    std::size_t burst_remaining_ = 0;
-    std::normal_distribution<double> dist_{0.0, 1.0}; //mean 0, stddev 1
-    std::lognormal_distribution<double> depth_dist_;
+    std::normal_distribution<double>     normal_{0.0, 1.0};
     std::uniform_real_distribution<double> uniform_{0.0, 1.0};
-    double current_price_;   // mid price (GBM)
-    double current_spread_;  // spread (OU)
-    bool in_burst_ = false;
 
+    uint64_t next_order_id_ = 1;
+    double   current_time_  = 0.0;
+    double   mu_;
+    double   spread_;
+
+    bool     in_burst_        = false;
+    size_t   burst_remaining_ = 0;
+
+    std::vector<double> hawkes_bid_times_;
+    std::vector<double> hawkes_ask_times_;
+    double   pending_hawkes_time_;
+    Side     pending_hawkes_side_;
+
+    std::map<int64_t, int64_t, std::greater<int64_t>> bid_levels_;
+    std::map<int64_t, int64_t>                         ask_levels_;
+    std::unordered_map<uint64_t, LiveOrder>             live_orders_;
+    std::priority_queue<ExpiryEntry, std::vector<ExpiryEntry>,
+                        std::greater<ExpiryEntry>>      expiry_queue_;
+
+    std::deque<GeneratedEvent> pending_events_;
+
+    int64_t  to_fixed(double price) const;
+    uint64_t time_to_ns(double t) const;
+    uint64_t apply_jitter(uint64_t ps);
+    void     update_burst();
+    int64_t  compute_best_bid() const;
+    int64_t  compute_best_ask() const;
+    double   hawkes_intensity_at(Side side, double t) const;
+    void     generate_next_hawkes();
+    void     prune_hawkes_history();
+    void     step_processes(double dt);
+    int64_t  sample_limit_price(Side side);
+    int64_t  sample_qty();
+    void     add_live_order(const LiveOrder& order);
+    void     remove_live_order(uint64_t order_id);
+    void     match_market_order(Side aggressor_side, int64_t qty, uint64_t ts_ns);
+    void     apply_price_impact(Side aggressor_side, int64_t fill_qty);
+    GeneratedEvent make_event(OrderEvent ev, uint64_t wait_ps) const;
 };

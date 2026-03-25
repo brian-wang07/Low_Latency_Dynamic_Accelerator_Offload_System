@@ -1,10 +1,13 @@
 #include "runtime_engine.hpp"
 
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 
 #include <immintrin.h>  // _mm_pause
+
+#include "../data/config.hpp"  // to_display, PRICE_SCALE
 
 
 template<std::size_t WindowSize>
@@ -15,8 +18,8 @@ BurstDetector<WindowSize>::BurstDetector(BurstCfg cfg)
 template<std::size_t WindowSize>
 BurstDetector<WindowSize>::BurstDetector()
     : BurstDetector(BurstCfg{
-        .burst_threshold_ns      = 10'000,   // enter burst if mean inter-arrival < 10us
-        .burst_exit_threshold_ns = 50'000,   // exit burst if mean inter-arrival > 50us
+        .burst_threshold_ns      = 20,  // enter burst if mean inter-arrival < 20ns (burst ≈ 5ns)
+        .burst_exit_threshold_ns = 35,  // exit burst if mean inter-arrival > 35ns (normal ≈ 50ns)
       }) {}
 
 template<std::size_t WindowSize>
@@ -75,17 +78,32 @@ BurstStats BurstDetector<WindowSize>::stats() const noexcept {
 template class BurstDetector<16>;
 
 
+static const char* order_type_str(uint8_t t) {
+    switch (t) {
+        case 0: return "ADD_L";
+        case 1: return "ADD_M";
+        case 2: return "CANCL";
+        case 3: return "EXEC ";
+        case 4: return "TRADE";
+    }
+    return "?????";
+}
+
+static const char* side_str(uint8_t s) {
+    return (s == 0) ? "BID" : "ASK";
+}
+
 
 TickProcessor::TickProcessor(double alpha, int print_every)
     : alpha_(alpha), print_every_(print_every) {}
 
 void TickProcessor::on_tick(const CachedTick& tick) {
     if (first_) {
-        ema_ = tick.price;
+        ema_ = tick.mid;
         first_ = false;
         window_start_ns_ = tick.received_at_ns;
     } else {
-        ema_ = alpha_ * tick.price + (1.0 - alpha_) * ema_;
+        ema_ = static_cast<int64_t>(alpha_ * tick.mid + (1.0 - alpha_) * ema_);
     }
 
     ++tick_count_;
@@ -98,12 +116,18 @@ void TickProcessor::on_tick(const CachedTick& tick) {
         window_start_ns_ = tick.received_at_ns;
     }
 
-    if (tick_count_ % print_every_ == 0) {
-        std::cout << "seq=" << tick.sequence_number
-                  << " price=" << tick.price
-                  << " ema=" << ema_
+    //if (tick_count_ % print_every_ == 0) {
+        std::cout << std::fixed << std::setprecision(6)
+                  << "seq=" << tick.sequence_number
+                  << " t=" << order_type_str(tick.order_type)
+                  << " s=" << side_str(tick.side)
+                  << " bid=" << to_display(tick.bid)
+                  << " ask=" << to_display(tick.ask)
+                  << " sprd=" << to_display(tick.ask - tick.bid)
+                  << " depth=" << tick.depth
+                  << " ema=" << to_display(ema_)
                   << " rate=" << tick_rate_ << " ticks/s\n";
-    }
+    //}
 }
 
 
@@ -124,16 +148,22 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
             continue;
         }
 
-        double   price       = block->latest_market_data.price.load(std::memory_order_relaxed);
-        uint64_t ts          = block->latest_market_data.timestamp.load(std::memory_order_relaxed);
+        // Read all market data fields (relaxed — guarded by acquire on sequence_number)
+        int64_t  bid        = block->latest_market_data.bid.load(std::memory_order_relaxed);
+        int64_t  ask        = block->latest_market_data.ask.load(std::memory_order_relaxed);
+        int64_t  mid        = block->latest_market_data.price.load(std::memory_order_relaxed);
+        uint32_t depth      = block->latest_market_data.depth.load(std::memory_order_relaxed);
+        uint8_t  order_type = block->latest_market_data.order_type.load(std::memory_order_relaxed);
+        uint8_t  side       = block->latest_market_data.side.load(std::memory_order_relaxed);
+        uint64_t ts         = block->latest_market_data.timestamp.load(std::memory_order_relaxed);
         uint64_t received_at = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
 
-        CachedTick tick{seq, price, ts, received_at};
+        CachedTick tick{seq, bid, ask, mid, depth, order_type, side, ts, received_at};
         cache_.push(tick);
         processor_.on_tick(tick);
-        detector_.on_tick(received_at);
+        detector_.on_tick(ts);  // use producer timestamp, not wall-clock
         last_seen_seq = seq;
 
         bool burst_now = detector_.in_burst();
@@ -145,7 +175,7 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
             if (pending_count_ < engine::shm::BATCH_SIZE) {
                 pending_batch_[pending_count_++] = engine::shm::AcceleratorTick{
                     .sequence_number  = seq,
-                    .price            = price,
+                    .price            = mid,
                     .arrival_delta_ns = delta,
                 };
             }
@@ -170,7 +200,7 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
                 std::cout << "[ROUTE] seq=" << seq
                           << " batch_size=" << pending_count_
                           << " burst_ticks=" << s.burst_tick_count
-                          << " ema_at_entry=" << batch.burst_meta.ema_at_entry << '\n';
+                          << " ema_at_entry=" << to_display(batch.burst_meta.ema_at_entry) << '\n';
 
                 pending_count_ = 0;
             }
@@ -190,7 +220,7 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
                     std::cout << "[ROUTE] seq=" << seq
                               << " batch_size=" << pending_count_
                               << " burst_ticks=" << s.burst_tick_count
-                              << " ema_at_entry=" << batch.burst_meta.ema_at_entry << '\n';
+                              << " ema_at_entry=" << to_display(batch.burst_meta.ema_at_entry) << '\n';
                     pending_count_ = 0;
                 }
 
@@ -203,10 +233,10 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
                                       .load(std::memory_order_acquire);
             if (result_seq > last_result_seq_) {
                 last_result_seq_ = result_seq;
-                double  proc_ema = block->accelerator_signal.processed_ema.load(std::memory_order_relaxed);
+                int64_t proc_ema = block->accelerator_signal.processed_ema.load(std::memory_order_relaxed);
                 int8_t  action   = block->accelerator_signal.signal_action.load(std::memory_order_relaxed);
                 std::cout << "[ACCEL] result_seq=" << result_seq
-                          << " processed_ema=" << proc_ema
+                          << " processed_ema=" << to_display(proc_ema)
                           << " action=" << static_cast<int>(action) << '\n';
             }
         }

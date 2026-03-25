@@ -1,0 +1,28 @@
+{
+  "base_interval_ns": 30,
+  "burst_interval_ns": 3,
+  "daily_volatility": 0.004,
+  "mean_reversion_speed": 0.08,
+  "burst_probability": 0.06,
+  "burst_volatility_multiplier": 3.5,
+  "seed": 42,
+
+  "mu_0": 1.0850,
+  "tick_size": 0.00001,
+  "kappa_s": 12.0,
+  "theta_s": 0.5,
+  "xi": 0.05,
+  "geom_p": 0.65,
+  "max_offset_ticks": 3,
+  "p_add_limit": 0.68,
+  "p_cancel": 0.25,
+  "p_add_market": 0.06,
+  "p_modify": 0.01,
+  "qty_log_mean": 8.5,
+  "qty_log_sigma": 0.5,
+  "lot_size": 100000,
+  "impact_coeff": 0.001,
+  "cancel_rate_gamma": 50000.0,
+  "burst_length": 6,
+  "jitter_sigma": 0.15
+}

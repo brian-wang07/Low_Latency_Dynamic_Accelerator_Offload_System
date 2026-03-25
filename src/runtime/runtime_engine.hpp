@@ -10,7 +10,12 @@
 
 struct CachedTick {
     uint64_t sequence_number;
-    double   price;
+    int64_t  bid;                // fixed-point (× PRICE_SCALE)
+    int64_t  ask;                // fixed-point (× PRICE_SCALE)
+    int64_t  mid;                // fixed-point (× PRICE_SCALE)
+    uint32_t depth;              // total depth (bid + ask sides)
+    uint8_t  order_type;         // EventType enum value
+    uint8_t  side;               // Side enum value (0=BID, 1=ASK)
     uint64_t data_timestamp_ns;  // from MarketData::timestamp
     uint64_t received_at_ns;     // steady_clock::now() at observation
 };
@@ -46,12 +51,12 @@ class TickProcessor {
 public:
     explicit TickProcessor(double alpha = 0.05, int print_every = 1000);
     void on_tick(const CachedTick& tick);
-    double ema() const noexcept { return ema_; }
+    int64_t ema() const noexcept { return ema_; }
 
 private:
     double   alpha_;
     int      print_every_;
-    double   ema_ = 0.0;
+    int64_t  ema_ = 0;          // fixed-point (× PRICE_SCALE)
     bool     first_ = true;
     int      tick_count_ = 0;
     uint64_t window_start_ns_ = 0;

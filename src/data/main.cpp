@@ -1,109 +1,142 @@
+#include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 
 #include "../common/shm_manager.hpp"
 #include "../common/shm_types.hpp"
+#include "config.hpp"
 #include "data_generator.hpp"
 
 static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
 
-int main() {
-  //catch potential ctrl c / explicit sigint and sigterm syscalls, to ensure that raii destructor is explicitly called.
-  //if this doesnt work, just do rm dev/shm/engine_shm_mvp
-  struct sigaction sa{};
-  sa.sa_handler = handle_signal;
-  sigaction(SIGINT,  &sa, nullptr);
-  sigaction(SIGTERM, &sa, nullptr);
-  ShmManager shm;
-  DataGeneratorConfig cfg{
-      .base_interval_ns = 100'000,          // 0.1 ms
-      .burst_interval_ns = 1'000,           // 0.001 ms
-      .burst_length = 5,
-      .start_price = 100.0,
-      .volatility = 0.05, 
-      .drift = 2e-6,                        // ~+1 per 5000 ticks at price 100
-      .burst_probability = 0.05,
-      .burst_volatility_multiplier = 0.5,
-      .seed = 42,
-      .jitter_sigma = 0.2,
-      .enable_bursts = true,
-      .spread_mean            = 0.10,
-      .spread_reversion_speed = 5.0,
-      .spread_volatility      = 0.02,
-      .min_spread             = 0.01,
-      .start_spread           = 0.10,
-      .depth_log_mean         = 500,
-      .depth_log_sigma        = 1,
-      .prob_limit             = 0.70,
-      .prob_bid               = 0.50,
-      .prob_new               = 0.60,
-      .prob_cancel            = 0.0,
-  };
+static const char* side_str(Side s) {
+    return (s == Side::BID) ? "BID" : "ASK";
+}
 
+int main(int argc, char* argv[]) {
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
-  if (shm.create()) {
-    DataGenerator generator(cfg);
-    using clock = std::chrono::steady_clock;
-    auto next_time = clock::now();
-    while (g_running) {
+    namespace fs = std::filesystem;
+    const fs::path configs_dir = fs::path(PROJECT_ROOT) / "configs";
 
-      auto tick = generator.next();
-
-      auto *block = shm.as<engine::shm::SharedMemoryBlock>();
-        
-      auto& md = block->latest_market_data;
-      md.bid.store       (tick.data.bid,                                          std::memory_order_relaxed);
-      md.ask.store       (tick.data.ask,                                          std::memory_order_relaxed);
-      md.depth.store     (tick.data.depth,                                        std::memory_order_relaxed);
-      md.price.store     ((tick.data.bid + tick.data.ask) / 2.0,                  std::memory_order_relaxed);
-      md.order_type.store(static_cast<uint8_t>(tick.data.order_type),             std::memory_order_relaxed);
-      md.side.store      (static_cast<uint8_t>(tick.data.side),                   std::memory_order_relaxed);
-      md.action.store    (static_cast<uint8_t>(tick.data.action),                 std::memory_order_relaxed);
-      md.timestamp.store (std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            clock::now().time_since_epoch()).count(),              std::memory_order_relaxed);
-      // sequence_number written last with release — establishes happens-before
-      // so the runtime's acquire load on seq makes all prior relaxed stores safe to read
-      md.sequence_number.store(tick.data.sequence_number, std::memory_order_release);
-
-      std::cout
-          << "seq="    << tick.data.sequence_number
-          << " price= " << tick.data.price
-          << " bid="   << tick.data.bid
-          << " ask="   << tick.data.ask
-          << " sprd="  << (tick.data.ask - tick.data.bid)
-          << " depth=" << tick.data.depth
-          << " type="  << (tick.data.order_type == OrderType::LIMIT ? "L" : "M")
-          << " side="  << (tick.data.side == Side::BID ? "B" : "A")
-          << " act="   << (tick.data.action == OrderAction::NEW ? "N"
-                         : tick.data.action == OrderAction::CANCEL ? "C" : "D")
-          << " burst=" << tick.in_burst
-          << '\n';
-
-      next_time += std::chrono::nanoseconds(tick.wait_ns);
-
-
-      // hybrid wait
-      while (g_running) {
-          auto now = clock::now();
-          if (now >= next_time) break;
-
-          auto remaining = next_time - now;
-
-          if (remaining > std::chrono::microseconds(50)) {
-              std::this_thread::sleep_for(remaining - std::chrono::microseconds(20));
-          }
-      }
+    ShmManager shm;
+    if (!shm.create()) {
+        std::cerr << "Failed to create shared memory\n";
+        return 1;
     }
-  }
 
-  else {
-    std::cerr << "Failed to create shared memory\n";
-    return 1;
-  }
+    do {
+        g_running = 1;
 
-  return 0;
+        fs::path cfg_path;
 
+        if (argc > 1) {
+            // Direct path from command line — run once, no loop
+            cfg_path = argv[1];
+        } else {
+            // Interactive picker from configs/
+            std::vector<std::string> configs;
+            if (fs::exists(configs_dir)) {
+                for (auto& e : fs::directory_iterator(configs_dir))
+                    if (e.path().extension() == ".json")
+                        configs.push_back(e.path().filename().string());
+                std::sort(configs.begin(), configs.end());
+            }
+
+            if (configs.empty()) {
+                std::cerr << "No .json files found in " << configs_dir << '\n';
+                break;
+            }
+
+            std::cout << "\nAvailable configs:\n";
+            for (size_t i = 0; i < configs.size(); ++i)
+                std::cout << "  " << (i + 1) << ") " << configs[i] << '\n';
+            std::cout << "Select (1-" << configs.size() << ", or q to quit): ";
+
+            std::string input;
+            if (!std::getline(std::cin, input) || input == "q" || input == "Q") break;
+
+            size_t idx;
+            try   { idx = std::stoul(input) - 1; }
+            catch (...) { std::cerr << "Invalid selection.\n"; continue; }
+            if (idx >= configs.size()) { std::cerr << "Out of range.\n"; continue; }
+
+            cfg_path = configs_dir / configs[idx];
+        }
+
+        DataGeneratorConfig cfg;
+        try   { cfg = load_config(cfg_path.string()); }
+        catch (const std::exception& e) {
+            std::cerr << "Error loading config: " << e.what() << '\n';
+            if (argc > 1) return 1;
+            continue;
+        }
+
+        std::cout << "Running " << cfg_path.filename() << " (Ctrl+C to stop)...\n";
+
+        DataGenerator generator(cfg);
+        using clock = std::chrono::steady_clock;
+        auto next_time = clock::now();
+        uint64_t shm_seq = 0;
+
+        while (g_running) {
+            auto ge = generator.next();
+            auto& ev = ge.event;
+
+            auto* block = shm.as<engine::shm::SharedMemoryBlock>();
+            auto& md    = block->latest_market_data;
+
+            md.bid.store       (ge.best_bid,                                              std::memory_order_relaxed);
+            md.ask.store       (ge.best_ask,                                              std::memory_order_relaxed);
+            md.depth.store     (static_cast<uint32_t>(ge.depth_bid + ge.depth_ask),       std::memory_order_relaxed);
+            md.price.store     (ge.mid,                                                   std::memory_order_relaxed);
+            md.order_type.store(static_cast<uint8_t>(ev.type),                            std::memory_order_relaxed);
+            md.side.store      (static_cast<uint8_t>(ev.side),                            std::memory_order_relaxed);
+            md.action.store    (static_cast<uint8_t>(ev.type),                            std::memory_order_relaxed);
+            md.timestamp.store (std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    clock::now().time_since_epoch()).count(),              std::memory_order_relaxed);
+            md.sequence_number.store(++shm_seq,                                           std::memory_order_release);
+
+            std::cout << std::fixed << std::setprecision(6)
+                << "seq="   << shm_seq
+                << " t="    << event_type_str(ev.type)
+                << " s="    << side_str(ev.side)
+                << " bid="  << to_display(ge.best_bid)
+                << " ask="  << to_display(ge.best_ask)
+                << " sprd=" << to_display(ge.best_ask - ge.best_bid)
+                << " dB="   << ge.depth_bid
+                << " dA="   << ge.depth_ask
+                << " px="   << (ev.price ? to_display(ev.price) : 0.0)
+                << " qty="  << ev.qty
+                << " oid="  << ev.order_id
+                << " wait=" << (ge.wait_ps / 1000.0) << "ns"
+                << " burst=" << ge.in_burst
+                << '\n';
+
+            if (ge.wait_ps > 0) {
+                next_time += std::chrono::nanoseconds(ge.wait_ps / 1000);
+
+                while (g_running) {
+                    auto now = clock::now();
+                    if (now >= next_time) break;
+                    auto remaining = next_time - now;
+                    if (remaining > std::chrono::microseconds(50))
+                        std::this_thread::sleep_for(remaining - std::chrono::microseconds(20));
+                }
+            }
+        }
+
+        std::cout << "\nStopped.\n";
+        if (argc > 1) break;
+    } while (true);
+
+    return 0;
 }

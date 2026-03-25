@@ -14,11 +14,11 @@ inline constexpr std::uint32_t SHM_VERSION = 1;
 inline constexpr std::uint8_t BATCH_SIZE = 64;
 
 struct AcceleratorTick {
-    // we dont need atomics here because all acceleratorticks within a burst will be sent in a batch atomically; 
+    // we dont need atomics here because all acceleratorticks within a burst will be sent in a batch atomically;
     // ticks themselves can be nonatomic
     //one consumer one producer => dont need padding
     uint64_t sequence_number;
-    double   price;
+    int64_t  price;             // fixed-point (× PRICE_SCALE)
     uint64_t arrival_delta_ns; //time between ticks sent to accelerator
 };
 
@@ -26,7 +26,7 @@ struct alignas(64) BurstMetadata {
     // runtime state at the moment burst started
     uint64_t burst_entry_time_ns;
     uint64_t tick_count;
-    double   ema_at_entry;
+    int64_t  ema_at_entry;      // fixed-point (× PRICE_SCALE)
 };
 
 struct alignas(64) AcceleratorBatch {
@@ -44,7 +44,7 @@ struct alignas(64) AcceleratorBatch {
 
 struct alignas(64) AcceleratorSignal {
     std::atomic<uint64_t> result_sequence_number;
-    std::atomic<double>   processed_ema;
+    std::atomic<int64_t>  processed_ema;    // fixed-point (× PRICE_SCALE)
     std::atomic<int8_t>   signal_action;
     std::atomic<bool>     routing_active;
 };
@@ -57,10 +57,10 @@ struct alignas(64) ShmHeader {
 
 struct alignas(64) MarketData {
     std::atomic<uint64_t> sequence_number;
-    std::atomic<double>   bid;
-    std::atomic<double>   ask;
+    std::atomic<int64_t>  bid;              // fixed-point (× PRICE_SCALE)
+    std::atomic<int64_t>  ask;              // fixed-point (× PRICE_SCALE)
     std::atomic<uint32_t> depth;
-    std::atomic<double>   price; //mid = (bid + ask) / 2
+    std::atomic<int64_t>  price;            // mid, fixed-point (× PRICE_SCALE)
     std::atomic<uint8_t>  order_type;
     std::atomic<uint8_t>  side;
     std::atomic<uint8_t>  action;
@@ -80,7 +80,6 @@ static_assert(offsetof(SharedMemoryBlock, latest_market_data) % 64 == 0);
 static_assert(offsetof(SharedMemoryBlock, data_to_accelerator) % 64 == 0);
 static_assert(offsetof(SharedMemoryBlock, accelerator_signal) % 64 == 0);
 static_assert(sizeof(SharedMemoryBlock) <= SHM_SIZE);
-static_assert(std::atomic<double>::is_always_lock_free);
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 static_assert(std::atomic<int8_t>::is_always_lock_free);

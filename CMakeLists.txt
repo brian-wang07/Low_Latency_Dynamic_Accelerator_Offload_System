@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 find_package(Threads REQUIRED)
 
 # Use C++23
@@ -18,6 +20,7 @@ target_link_libraries(data_generator_lib PUBLIC common)
 
 # Process 1: Data Simulator
 add_executable(data_sim src/data/main.cpp)
+target_compile_definitions(data_sim PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
 target_link_libraries(data_sim PRIVATE data_generator_lib Threads::Threads rt)
 
 # Tests
