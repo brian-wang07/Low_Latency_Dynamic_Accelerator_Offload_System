@@ -27,8 +27,14 @@ target_link_libraries(data_sim PRIVATE data_generator_lib Threads::Threads rt)
 add_executable(data_test src/tests/data.cpp)
 target_link_libraries(data_test PRIVATE data_generator_lib Threads::Threads rt)
 
+# Order book test
+add_executable(order_book_test src/tests/order_book_test.cpp src/runtime/order_book.cpp)
+target_include_directories(order_book_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+
 # Process 2: Runtime Engine
-add_executable(runtime_engine src/runtime/main.cpp src/runtime/runtime_engine.cpp)
+add_executable(runtime_engine src/runtime/main.cpp src/runtime/runtime_engine.cpp src/runtime/order_book.cpp)
 target_include_directories(runtime_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
 target_link_libraries(runtime_engine PRIVATE common Threads::Threads rt)
 

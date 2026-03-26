@@ -1,13 +1,13 @@
 #include "runtime_engine.hpp"
 
 #include <chrono>
-#include <iomanip>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 
-#include <immintrin.h>  // _mm_pause
+#include <immintrin.h>
 
-#include "../data/config.hpp"  // to_display, PRICE_SCALE
+#include "engine_types.hpp"
 
 
 template<std::size_t WindowSize>
@@ -18,8 +18,8 @@ BurstDetector<WindowSize>::BurstDetector(BurstCfg cfg)
 template<std::size_t WindowSize>
 BurstDetector<WindowSize>::BurstDetector()
     : BurstDetector(BurstCfg{
-        .burst_threshold_ns      = 20,  // enter burst if mean inter-arrival < 20ns (burst ≈ 5ns)
-        .burst_exit_threshold_ns = 35,  // exit burst if mean inter-arrival > 35ns (normal ≈ 50ns)
+        .burst_threshold_ns      = 20,
+        .burst_exit_threshold_ns = 35,
       }) {}
 
 template<std::size_t WindowSize>
@@ -35,7 +35,6 @@ void BurstDetector<WindowSize>::on_tick(uint64_t received_at_ns) {
     uint64_t new_delta = received_at_ns - prev;
 
     if (filled_ == WindowSize) {
-        // evict oldest delta: between timestamps_[head_] and its successor
         uint64_t evicted = timestamps_[(head_ + 1) % WindowSize] - timestamps_[head_];
         running_sum_ -= evicted;
     } else {
@@ -74,62 +73,48 @@ BurstStats BurstDetector<WindowSize>::stats() const noexcept {
     };
 }
 
-// explicit instantiation for the default used by RuntimeEngine
 template class BurstDetector<16>;
 
 
-static const char* order_type_str(uint8_t t) {
-    switch (t) {
-        case 0: return "ADD_L";
-        case 1: return "ADD_M";
-        case 2: return "CANCL";
-        case 3: return "EXEC ";
-        case 4: return "TRADE";
-    }
-    return "?????";
-}
+TickProcessor::TickProcessor(double alpha) : alpha_(alpha) {}
 
-static const char* side_str(uint8_t s) {
-    return (s == 0) ? "BID" : "ASK";
-}
-
-
-TickProcessor::TickProcessor(double alpha, int print_every)
-    : alpha_(alpha), print_every_(print_every) {}
-
-void TickProcessor::on_tick(const CachedTick& tick) {
+void TickProcessor::on_tick(int64_t mid, uint64_t received_at_ns) {
     if (first_) {
-        ema_ = tick.mid;
+        ema_ = mid;
         first_ = false;
-        window_start_ns_ = tick.received_at_ns;
+        window_start_ns_ = received_at_ns;
     } else {
-        ema_ = static_cast<int64_t>(alpha_ * tick.mid + (1.0 - alpha_) * ema_);
+        ema_ = static_cast<int64_t>(alpha_ * mid + (1.0 - alpha_) * ema_);
     }
 
-    ++tick_count_;
     ++ticks_in_window_;
 
-    uint64_t elapsed_ns = tick.received_at_ns - window_start_ns_;
+    uint64_t elapsed_ns = received_at_ns - window_start_ns_;
     if (elapsed_ns >= 1'000'000'000ULL) {
         tick_rate_ = static_cast<double>(ticks_in_window_) * 1e9 / static_cast<double>(elapsed_ns);
         ticks_in_window_ = 0;
-        window_start_ns_ = tick.received_at_ns;
+        window_start_ns_ = received_at_ns;
     }
-
-    //if (tick_count_ % print_every_ == 0) {
-        std::cout << std::fixed << std::setprecision(6)
-                  << "seq=" << tick.sequence_number
-                  << " t=" << order_type_str(tick.order_type)
-                  << " s=" << side_str(tick.side)
-                  << " bid=" << to_display(tick.bid)
-                  << " ask=" << to_display(tick.ask)
-                  << " sprd=" << to_display(tick.ask - tick.bid)
-                  << " depth=" << tick.depth
-                  << " ema=" << to_display(ema_)
-                  << " rate=" << tick_rate_ << " ticks/s\n";
-    //}
 }
 
+
+void RuntimeEngine::flush_batch(engine::shm::SharedMemoryBlock* block, uint64_t seq) {
+    auto& batch = block->data_to_accelerator;
+    batch.burst_meta.tick_count = pending_count_;
+    for (uint32_t i = 0; i < pending_count_; ++i)
+        batch.ticks[i] = pending_batch_[i];
+    batch.count = pending_count_;
+    batch.batch_sequence_number.store(++last_batch_seq_, std::memory_order_release);
+    block->accelerator_signal.routing_active.store(true, std::memory_order_release);
+
+    auto s = detector_.stats();
+    std::cout << "[ROUTE] seq=" << seq
+              << " batch_size=" << pending_count_
+              << " burst_ticks=" << s.burst_tick_count
+              << " ema_at_entry=" << to_display(batch.burst_meta.ema_at_entry) << '\n';
+
+    pending_count_ = 0;
+}
 
 void RuntimeEngine::run(volatile sig_atomic_t& running) {
     std::cout << "Waiting for shared memory...\n";
@@ -139,109 +124,142 @@ void RuntimeEngine::run(volatile sig_atomic_t& running) {
     std::cout << "Attached to shared memory. Polling...\n";
 
     auto* block = shm_.as<engine::shm::SharedMemoryBlock>();
-    uint64_t last_seen_seq = 0;
+    auto& ring  = block->event_ring;
+    uint64_t events_since_print = 0;
 
     while (running) {
-        uint64_t seq = block->latest_market_data.sequence_number.load(std::memory_order_acquire);
-        if (seq == last_seen_seq) {
+        uint64_t head = ring.head.load(std::memory_order_acquire);
+        if (head == last_ring_tail_) {
             _mm_pause();
             continue;
         }
 
-        // Read all market data fields (relaxed — guarded by acquire on sequence_number)
-        int64_t  bid        = block->latest_market_data.bid.load(std::memory_order_relaxed);
-        int64_t  ask        = block->latest_market_data.ask.load(std::memory_order_relaxed);
-        int64_t  mid        = block->latest_market_data.price.load(std::memory_order_relaxed);
-        uint32_t depth      = block->latest_market_data.depth.load(std::memory_order_relaxed);
-        uint8_t  order_type = block->latest_market_data.order_type.load(std::memory_order_relaxed);
-        uint8_t  side       = block->latest_market_data.side.load(std::memory_order_relaxed);
-        uint64_t ts         = block->latest_market_data.timestamp.load(std::memory_order_relaxed);
-        uint64_t received_at = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
+        while (last_ring_tail_ < head) {
+            const auto& slot = ring.slots[last_ring_tail_ & engine::shm::EVENT_RING_MASK];
 
-        CachedTick tick{seq, bid, ask, mid, depth, order_type, side, ts, received_at};
-        cache_.push(tick);
-        processor_.on_tick(tick);
-        detector_.on_tick(ts);  // use producer timestamp, not wall-clock
-        last_seen_seq = seq;
-
-        bool burst_now = detector_.in_burst();
-
-        if (burst_now) {
-            uint64_t delta = (prev_tick_received_at_ > 0)
-                ? received_at - prev_tick_received_at_ : 0;
-
-            if (pending_count_ < engine::shm::BATCH_SIZE) {
-                pending_batch_[pending_count_++] = engine::shm::AcceleratorTick{
-                    .sequence_number  = seq,
-                    .price            = mid,
-                    .arrival_delta_ns = delta,
-                };
+            // book dispatch
+            switch (slot.type) {
+                case static_cast<uint8_t>(EventType::ADD_LIMIT):
+                    book_.on_add_limit(slot.order_id, slot.side, slot.price, slot.qty);
+                    break;
+                case static_cast<uint8_t>(EventType::CANCEL):
+                    book_.on_cancel(slot.order_id);
+                    break;
+                case static_cast<uint8_t>(EventType::EXECUTE):
+                    book_.on_execute(slot.side, slot.price, slot.qty, slot.qty_remaining);
+                    break;
+                case static_cast<uint8_t>(EventType::RESET):
+                    book_.clear();
+                    break;
+                default:
+                    break;
             }
 
-            if (!was_in_burst_) {
-                // record burst entry metadata; flush happens at burst end or batch full
-                auto& batch = block->data_to_accelerator;
-                batch.burst_meta.burst_entry_time_ns = received_at;
-                batch.burst_meta.ema_at_entry        = processor_.ema();
-            }
+            // derive market state from book
+            int64_t bid = book_.best_bid();
+            int64_t ask = book_.best_ask();
+            int64_t mid = (bid && ask) ? (bid + ask) / 2 : (bid | ask);
+            uint64_t received_at = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
 
-            if (pending_count_ == engine::shm::BATCH_SIZE) {
-                auto& batch = block->data_to_accelerator;
-                batch.burst_meta.tick_count = pending_count_;
-                for (uint32_t i = 0; i < pending_count_; ++i)
-                    batch.ticks[i] = pending_batch_[i];
-                batch.count = pending_count_;
-                batch.batch_sequence_number.store(++last_batch_seq_, std::memory_order_release);
-                block->accelerator_signal.routing_active.store(true, std::memory_order_release);
+            detector_.on_tick(slot.timestamp_ns);
+            processor_.on_tick(mid, received_at);
 
-                auto s = detector_.stats();
-                std::cout << "[ROUTE] seq=" << seq
-                          << " batch_size=" << pending_count_
-                          << " burst_ticks=" << s.burst_tick_count
-                          << " ema_at_entry=" << to_display(batch.burst_meta.ema_at_entry) << '\n';
+            // burst / accelerator routing
+            bool burst_now = detector_.in_burst();
 
-                pending_count_ = 0;
-            }
-        } else {
-            if (was_in_burst_) {
-                auto s = detector_.stats();
+            if (burst_now) {
+                uint64_t delta = (prev_tick_received_at_ > 0)
+                    ? received_at - prev_tick_received_at_ : 0;
 
-                if (pending_count_ > 0) {
-                    auto& batch = block->data_to_accelerator;
-                    batch.burst_meta.tick_count = pending_count_;
-                    for (uint32_t i = 0; i < pending_count_; ++i)
-                        batch.ticks[i] = pending_batch_[i];
-                    batch.count = pending_count_;
-                    batch.batch_sequence_number.store(++last_batch_seq_, std::memory_order_release);
-                    block->accelerator_signal.routing_active.store(true, std::memory_order_release);
-
-                    std::cout << "[ROUTE] seq=" << seq
-                              << " batch_size=" << pending_count_
-                              << " burst_ticks=" << s.burst_tick_count
-                              << " ema_at_entry=" << to_display(batch.burst_meta.ema_at_entry) << '\n';
-                    pending_count_ = 0;
+                if (pending_count_ < engine::shm::BATCH_SIZE) {
+                    pending_batch_[pending_count_++] = engine::shm::AcceleratorTick{
+                        .sequence_number  = slot.sequence,
+                        .price            = mid,
+                        .arrival_delta_ns = delta,
+                    };
                 }
 
-                std::cout << "[ROUTE END] burst_ticks=" << s.burst_tick_count
-                          << " mean_inter_arrival_ns=" << s.mean_inter_arrival_ns << '\n';
+                if (!was_in_burst_) {
+                    auto& batch = block->data_to_accelerator;
+                    batch.burst_meta.burst_entry_time_ns = received_at;
+                    batch.burst_meta.ema_at_entry        = processor_.ema();
+                }
+
+                if (pending_count_ == engine::shm::BATCH_SIZE)
+                    flush_batch(block, slot.sequence);
+            } else {
+                if (was_in_burst_) {
+                    if (pending_count_ > 0)
+                        flush_batch(block, slot.sequence);
+
+                    auto s = detector_.stats();
+                    std::cout << "[ROUTE END] burst_ticks=" << s.burst_tick_count
+                              << " mean_inter_arrival_ns=" << s.mean_inter_arrival_ns << '\n';
+                }
+
+                uint64_t result_seq = block->accelerator_signal.result_sequence_number
+                                          .load(std::memory_order_acquire);
+                if (result_seq > last_result_seq_) {
+                    last_result_seq_ = result_seq;
+                    int64_t proc_ema = block->accelerator_signal.processed_ema.load(std::memory_order_relaxed);
+                    int8_t  action   = block->accelerator_signal.signal_action.load(std::memory_order_relaxed);
+                    std::cout << "[ACCEL] result_seq=" << result_seq
+                              << " processed_ema=" << to_display(proc_ema)
+                              << " action=" << static_cast<int>(action) << '\n';
+                }
             }
 
-            // collect any pending accelerator response
-            uint64_t result_seq = block->accelerator_signal.result_sequence_number
-                                      .load(std::memory_order_acquire);
-            if (result_seq > last_result_seq_) {
-                last_result_seq_ = result_seq;
-                int64_t proc_ema = block->accelerator_signal.processed_ema.load(std::memory_order_relaxed);
-                int8_t  action   = block->accelerator_signal.signal_action.load(std::memory_order_relaxed);
-                std::cout << "[ACCEL] result_seq=" << result_seq
-                          << " processed_ema=" << to_display(proc_ema)
-                          << " action=" << static_cast<int>(action) << '\n';
-            }
+            was_in_burst_          = burst_now;
+            prev_tick_received_at_ = received_at;
+            ++last_ring_tail_;
+            ++events_since_print;
         }
 
-        was_in_burst_          = burst_now;
-        prev_tick_received_at_ = received_at;
+        ring.tail.store(last_ring_tail_, std::memory_order_release);
+
+        if (events_since_print >= 64) {
+            print_book();
+            events_since_print = 0;
+        }
     }
+}
+
+void RuntimeEngine::print_book() const {
+    constexpr std::size_t DEPTH = 8;
+    PriceLevel bids[DEPTH], asks[DEPTH];
+    std::size_t nb = book_.bid_depth(bids, DEPTH);
+    std::size_t na = book_.ask_depth(asks, DEPTH);
+
+    // clear screen, cursor to top-left
+    printf("\033[2J\033[H");
+
+    printf("  %-12s %-10s %-6s   %-6s %-10s %-12s\n",
+           "BID PRICE", "QTY", "#ORD", "#ORD", "QTY", "ASK PRICE");
+    printf("  %-12s %-10s %-6s   %-6s %-10s %-12s\n",
+           "----------", "-------", "----", "----", "-------", "----------");
+
+    for (std::size_t i = 0; i < DEPTH; ++i) {
+        if (i < nb)
+            printf("  %-12.6f %-10ld %-6u   ",
+                   to_display(bids[i].price), bids[i].total_qty, bids[i].order_count);
+        else
+            printf("  %-12s %-10s %-6s   ", "", "", "");
+
+        if (i < na)
+            printf("%-6u %-10ld %-12.6f",
+                   asks[i].order_count, asks[i].total_qty, to_display(asks[i].price));
+
+        printf("\n");
+    }
+
+    printf("\n  spread: %.6f  imbalance: %.4f  vwmid: %.6f\n",
+           to_display(book_.spread()),
+           book_.bid_ask_imbalance(3),
+           book_.volume_weighted_mid(3) / PRICE_SCALE);
+    printf("  bid_qty: %lu  ask_qty: %lu  ema: %.6f  rate: %.0f ticks/s\n",
+           book_.total_bid_qty(), book_.total_ask_qty(),
+           to_display(processor_.ema()), processor_.tick_rate());
+    fflush(stdout);
 }

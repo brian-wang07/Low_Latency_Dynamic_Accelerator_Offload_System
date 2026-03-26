@@ -4,14 +4,19 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "engine_types.hpp"
+
 namespace engine::shm {
 
 inline constexpr const char*   SHM_NAME = "/engine_shm_mvp";
 inline constexpr std::size_t   SHM_SIZE = 1024 * 1024; // 1MB for MVP
 inline constexpr std::uint32_t SHM_MAGIC = 0x454E474E; //version validation
-inline constexpr std::uint32_t SHM_VERSION = 1;
+inline constexpr std::uint32_t SHM_VERSION = 3;
 
-inline constexpr std::uint8_t BATCH_SIZE = 64;
+inline constexpr std::uint8_t  BATCH_SIZE          = 64;
+inline constexpr std::uint32_t EVENT_RING_CAPACITY = 8192;
+inline constexpr std::uint32_t EVENT_RING_MASK     = EVENT_RING_CAPACITY - 1;
+static_assert((EVENT_RING_CAPACITY & (EVENT_RING_CAPACITY - 1)) == 0, "must be power of 2");
 
 struct AcceleratorTick {
     // we dont need atomics here because all acceleratorticks within a burst will be sent in a batch atomically;
@@ -50,35 +55,41 @@ struct alignas(64) AcceleratorSignal {
 };
 
 
+struct alignas(64) ShmOrderEvent {
+    uint64_t sequence;        // monotonic; 0 = unwritten
+    uint64_t timestamp_ns;
+    uint64_t order_id;
+    int64_t  price;           // the ORDER's quoted price, fixed-point × PRICE_SCALE
+                              // (limit price for ADD_LIMIT/CANCEL, fill price for EXECUTE, 0 for ADD_MARKET)
+    int64_t  qty;
+    int64_t  qty_remaining;
+    uint8_t  type;            // EventType enum
+    uint8_t  side;            // Side enum
+    uint8_t  _pad[6];
+};
+static_assert(sizeof(ShmOrderEvent) == 64);
+
+struct alignas(64) EventRingBuffer {
+    alignas(64) std::atomic<uint64_t> head{0};  // next slot producer will write (producer-owned)
+    alignas(64) std::atomic<uint64_t> tail{0};  // next slot consumer will read (consumer-owned)
+    alignas(64) ShmOrderEvent slots[EVENT_RING_CAPACITY];
+};
+
 struct alignas(64) ShmHeader {
     uint32_t magic;
     uint32_t version;
 };
 
-struct alignas(64) MarketData {
-    std::atomic<uint64_t> sequence_number;
-    std::atomic<int64_t>  bid;              // fixed-point (× PRICE_SCALE)
-    std::atomic<int64_t>  ask;              // fixed-point (× PRICE_SCALE)
-    std::atomic<uint32_t> depth;
-    std::atomic<int64_t>  price;            // mid, fixed-point (× PRICE_SCALE)
-    std::atomic<uint8_t>  order_type;
-    std::atomic<uint8_t>  side;
-    std::atomic<uint8_t>  action;
-    uint8_t               _pad[5];
-    std::atomic<uint64_t> timestamp;
-};
-
-
 struct SharedMemoryBlock {
     alignas(64) ShmHeader         header;
-    alignas(64) MarketData        latest_market_data; //data -> runtime
-    alignas(64) AcceleratorBatch  data_to_accelerator; //runtime -> accelerator
-    alignas(64) AcceleratorSignal accelerator_signal; //accelerator -> runtime
+    alignas(64) AcceleratorBatch  data_to_accelerator; // runtime -> accelerator
+    alignas(64) AcceleratorSignal accelerator_signal;   // accelerator -> runtime
+    alignas(64) EventRingBuffer   event_ring;           // data -> runtime
 };
 
-static_assert(offsetof(SharedMemoryBlock, latest_market_data) % 64 == 0);
 static_assert(offsetof(SharedMemoryBlock, data_to_accelerator) % 64 == 0);
 static_assert(offsetof(SharedMemoryBlock, accelerator_signal) % 64 == 0);
+static_assert(offsetof(SharedMemoryBlock, event_ring) % 64 == 0);
 static_assert(sizeof(SharedMemoryBlock) <= SHM_SIZE);
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
 static_assert(std::atomic<uint64_t>::is_always_lock_free);

@@ -7,18 +7,7 @@
 
 #include "shm_manager.hpp"
 #include "shm_types.hpp"
-
-struct CachedTick {
-    uint64_t sequence_number;
-    int64_t  bid;                // fixed-point (× PRICE_SCALE)
-    int64_t  ask;                // fixed-point (× PRICE_SCALE)
-    int64_t  mid;                // fixed-point (× PRICE_SCALE)
-    uint32_t depth;              // total depth (bid + ask sides)
-    uint8_t  order_type;         // EventType enum value
-    uint8_t  side;               // Side enum value (0=BID, 1=ASK)
-    uint64_t data_timestamp_ns;  // from MarketData::timestamp
-    uint64_t received_at_ns;     // steady_clock::now() at observation
-};
+#include "order_book.hpp"
 
 struct BurstStats {
     uint64_t mean_inter_arrival_ns;
@@ -31,34 +20,17 @@ struct BurstCfg {
     uint64_t burst_exit_threshold_ns;
 };
 
-
-template<typename T, std::size_t N>
-class RingBuffer {
-    static_assert((N & (N - 1)) == 0, "N must be a power of 2");
-public:
-    void push(const T& item) {
-        buf_[head_ & (N - 1)] = item;
-        ++head_;
-    }
-    std::size_t count() const noexcept { return head_ < N ? head_ : N; }
-    const T& operator[](std::size_t i) const noexcept { return buf_[i & (N - 1)]; }
-private:
-    std::array<T, N> buf_{};
-    std::size_t head_ = 0;
-};
-
 class TickProcessor {
 public:
-    explicit TickProcessor(double alpha = 0.05, int print_every = 1000);
-    void on_tick(const CachedTick& tick);
+    explicit TickProcessor(double alpha = 0.05);
+    void on_tick(int64_t mid, uint64_t received_at_ns);
     int64_t ema() const noexcept { return ema_; }
+    double  tick_rate() const noexcept { return tick_rate_; }
 
 private:
     double   alpha_;
-    int      print_every_;
-    int64_t  ema_ = 0;          // fixed-point (× PRICE_SCALE)
+    int64_t  ema_ = 0;
     bool     first_ = true;
-    int      tick_count_ = 0;
     uint64_t window_start_ns_ = 0;
     int      ticks_in_window_ = 0;
     double   tick_rate_ = 0.0;
@@ -78,7 +50,7 @@ private:
     std::array<uint64_t, WindowSize> timestamps_{};
     bool        in_burst_ = false;
     std::size_t head_   = 0;
-    std::size_t filled_ = 0;  // capped at WindowSize once full
+    std::size_t filled_ = 0;
     uint64_t    burst_threshold_ns_;
     uint64_t    burst_exit_threshold_ns_;
     uint64_t    burst_entry_ns_    = 0;
@@ -86,22 +58,27 @@ private:
     uint64_t    running_sum_       = 0;
 };
 
-
 class RuntimeEngine {
 public:
     void run(volatile sig_atomic_t& running);
 
 private:
     ShmManager shm_;
-    RingBuffer<CachedTick, 1024> cache_;
     TickProcessor processor_;
     BurstDetector<> detector_;
+    OrderBook book_;
 
-    // batch accumulation
+    // ring consumer state
+    uint64_t last_ring_tail_ = 0;
+
+    // accelerator batch accumulation
     engine::shm::AcceleratorTick pending_batch_[engine::shm::BATCH_SIZE]{};
-    uint32_t pending_count_        = 0;
-    uint64_t last_batch_seq_       = 0;
-    uint64_t last_result_seq_      = 0;
+    uint32_t pending_count_         = 0;
+    uint64_t last_batch_seq_        = 0;
+    uint64_t last_result_seq_       = 0;
     uint64_t prev_tick_received_at_ = 0;
-    bool     was_in_burst_         = false;
+    bool     was_in_burst_          = false;
+
+    void flush_batch(engine::shm::SharedMemoryBlock* block, uint64_t seq);
+    void print_book() const;
 };

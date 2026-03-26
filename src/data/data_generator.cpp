@@ -125,9 +125,17 @@ int64_t DataGenerator::sample_limit_price(Side side) {
         if (u <= cum) { delta = k; break; }
     }
 
-    return (side == Side::BID)
-        ? compute_best_bid() - static_cast<int64_t>(delta) * tick_fp
-        : compute_best_ask() + static_cast<int64_t>(delta) * tick_fp;
+    if (side == Side::BID) {
+        int64_t price = compute_best_bid() - static_cast<int64_t>(delta) * tick_fp;
+        if (!ask_levels_.empty())
+            price = std::min(price, ask_levels_.begin()->first - tick_fp);
+        return price;
+    } else {
+        int64_t price = compute_best_ask() + static_cast<int64_t>(delta) * tick_fp;
+        if (!bid_levels_.empty())
+            price = std::max(price, bid_levels_.begin()->first + tick_fp);
+        return price;
+    }
 }
 
 int64_t DataGenerator::sample_qty() {

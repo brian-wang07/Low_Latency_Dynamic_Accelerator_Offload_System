@@ -6,6 +6,8 @@
 #include <iostream>
 #include <thread>
 
+#include <immintrin.h>
+
 #include "../common/shm_manager.hpp"
 #include "../common/shm_types.hpp"
 #include "config.hpp"
@@ -13,10 +15,6 @@
 
 static volatile sig_atomic_t g_running = 1;
 static void handle_signal(int) { g_running = 0; }
-
-static const char* side_str(Side s) {
-    return (s == Side::BID) ? "BID" : "ASK";
-}
 
 int main(int argc, char* argv[]) {
     struct sigaction sa{};
@@ -85,39 +83,48 @@ int main(int argc, char* argv[]) {
         DataGenerator generator(cfg);
         using clock = std::chrono::steady_clock;
         auto next_time = clock::now();
-        uint64_t shm_seq = 0;
+
+        auto* block = shm.as<engine::shm::SharedMemoryBlock>();
+        auto& ring  = block->event_ring;
+
+        // signal runtime to reset book state
+        {
+            uint64_t h = ring.head.load(std::memory_order_relaxed);
+            auto& slot = ring.slots[h & engine::shm::EVENT_RING_MASK];
+            slot.sequence = h + 1;
+            slot.type = static_cast<uint8_t>(EventType::RESET);
+            ring.head.store(h + 1, std::memory_order_release);
+        }
 
         while (g_running) {
             auto ge = generator.next();
             auto& ev = ge.event;
 
-            auto* block = shm.as<engine::shm::SharedMemoryBlock>();
-            auto& md    = block->latest_market_data;
+            // spin-wait until ring has space (never drop events)
+            uint64_t h = ring.head.load(std::memory_order_relaxed);
+            while (h - ring.tail.load(std::memory_order_acquire) >= engine::shm::EVENT_RING_CAPACITY) {
+                _mm_pause();
+                if (!g_running) goto done;
+            }
 
-            md.bid.store       (ge.best_bid,                                              std::memory_order_relaxed);
-            md.ask.store       (ge.best_ask,                                              std::memory_order_relaxed);
-            md.depth.store     (static_cast<uint32_t>(ge.depth_bid + ge.depth_ask),       std::memory_order_relaxed);
-            md.price.store     (ge.mid,                                                   std::memory_order_relaxed);
-            md.order_type.store(static_cast<uint8_t>(ev.type),                            std::memory_order_relaxed);
-            md.side.store      (static_cast<uint8_t>(ev.side),                            std::memory_order_relaxed);
-            md.action.store    (static_cast<uint8_t>(ev.type),                            std::memory_order_relaxed);
-            md.timestamp.store (std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    clock::now().time_since_epoch()).count(),              std::memory_order_relaxed);
-            md.sequence_number.store(++shm_seq,                                           std::memory_order_release);
+            auto& slot         = ring.slots[h & engine::shm::EVENT_RING_MASK];
+            slot.sequence      = h + 1;
+            slot.timestamp_ns  = ev.timestamp_ns;
+            slot.order_id      = ev.order_id;
+            slot.price         = ev.price;
+            slot.qty           = ev.qty;
+            slot.qty_remaining = ev.qty_remaining;
+            slot.type          = static_cast<uint8_t>(ev.type);
+            slot.side          = static_cast<uint8_t>(ev.side);
+            ring.head.store(h + 1, std::memory_order_release);
 
             std::cout << std::fixed << std::setprecision(6)
-                << "seq="   << shm_seq
-                << " t="    << event_type_str(ev.type)
-                << " s="    << side_str(ev.side)
-                << " bid="  << to_display(ge.best_bid)
-                << " ask="  << to_display(ge.best_ask)
-                << " sprd=" << to_display(ge.best_ask - ge.best_bid)
-                << " dB="   << ge.depth_bid
-                << " dA="   << ge.depth_ask
-                << " px="   << (ev.price ? to_display(ev.price) : 0.0)
-                << " qty="  << ev.qty
-                << " oid="  << ev.order_id
-                << " wait=" << (ge.wait_ps / 1000.0) << "ns"
+                << "seq=" << (h + 1)
+                << " t="  << event_type_str(ev.type)
+                << " s="  << (ev.side == Side::BID ? "BID" : "ASK")
+                << " px=" << (ev.price ? to_display(ev.price) : 0.0)
+                << " qty=" << ev.qty
+                << " oid=" << ev.order_id
                 << " burst=" << ge.in_burst
                 << '\n';
 
@@ -133,6 +140,7 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+        done:
 
         std::cout << "\nStopped.\n";
         if (argc > 1) break;
