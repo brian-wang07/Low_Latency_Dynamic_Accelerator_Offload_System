@@ -11,7 +11,9 @@
 #include <GLFW/glfw3.h>
 
 static void render_order_book(const BookSnapshot& s) {
-    ImGui::Begin("Order Book");
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+    ImGui::Begin("Order Book", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
     // Header metrics
     ImGui::Text("Spread: %.6f", to_display(s.spread));
@@ -113,7 +115,7 @@ void DisplayThread::run(const BookSnapshot& snapshot, volatile sig_atomic_t& run
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    GLFWwindow* window = glfwCreateWindow(900, 500, "Order Book", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1200, 800, "Order Book", nullptr, nullptr);
     if (!window) {
         std::fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();

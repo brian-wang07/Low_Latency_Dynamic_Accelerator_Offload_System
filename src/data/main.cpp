@@ -83,6 +83,8 @@ int main(int argc, char* argv[]) {
         DataGenerator generator(cfg);
         using clock = std::chrono::steady_clock;
         auto next_time = clock::now();
+        auto last_print = clock::now();
+        uint64_t ticks_since_print = 0;
 
         auto* block = shm.as<engine::shm::SharedMemoryBlock>();
         auto& ring  = block->event_ring;
@@ -117,16 +119,23 @@ int main(int argc, char* argv[]) {
             slot.type          = static_cast<uint8_t>(ev.type);
             slot.side          = static_cast<uint8_t>(ev.side);
             ring.head.store(h + 1, std::memory_order_release);
+            ++ticks_since_print;
 
-            std::cout << std::fixed << std::setprecision(6)
-                << "seq=" << (h + 1)
-                << " t="  << event_type_str(ev.type)
-                << " s="  << (ev.side == Side::BID ? "BID" : "ASK")
-                << " px=" << (ev.price ? to_display(ev.price) : 0.0)
-                << " qty=" << ev.qty
-                << " oid=" << ev.order_id
-                << " burst=" << ge.in_burst
-                << '\n';
+            auto now_print = clock::now();
+            if (now_print - last_print >= std::chrono::seconds(1)) {
+                std::cout << std::fixed << std::setprecision(6)
+                    << "[" << ticks_since_print << " ticks/s]"
+                    << " seq=" << (h + 1)
+                    << " t="  << event_type_str(ev.type)
+                    << " s="  << (ev.side == Side::BID ? "BID" : "ASK")
+                    << " px=" << (ev.price ? to_display(ev.price) : 0.0)
+                    << " qty=" << ev.qty
+                    << " oid=" << ev.order_id
+                    << " burst=" << ge.in_burst
+                    << '\n';
+                ticks_since_print = 0;
+                last_print = now_print;
+            }
 
             if (ge.wait_ps > 0) {
                 next_time += std::chrono::nanoseconds(ge.wait_ps / 1000);

@@ -9,71 +9,106 @@ void OrderBook::on_add_limit(uint64_t order_id, uint8_t side, int64_t price, int
     };
 
     if (side == 0) {
-        // BID
         auto &level = bids_[price];
         level.price = price;
         level.total_qty += qty;
         level.order_count++;
+        bid_order_idx_[price].push_back(order_id);
     }
     else {
-        //ASK
         auto &level = asks_[price];
         level.price = price;
         level.total_qty += qty;
         level.order_count++;
+        ask_order_idx_[price].push_back(order_id);
     }
 }
 
 
 void OrderBook::on_execute(uint8_t side, int64_t price, int64_t qty, int64_t qty_remaining) {
-    auto do_execute = [&](auto& map) {
-        auto lit = map.find(price);
-        if (lit == map.end()) return;
+    auto do_execute = [&](auto& level_map, auto& idx_map) {
+        auto lit = level_map.find(price);
+        if (lit == level_map.end()) return;
         lit->second.total_qty -= qty;
+
         int64_t to_fill = qty;
-        for (auto oit = orders_.begin(); oit != orders_.end() && to_fill > 0; ) {
-            TrackedOrder &o = oit->second;
-            if (o.side == side && o.price == price) {
+        auto idx_it = idx_map.find(price);
+        if (idx_it != idx_map.end()) {
+            auto& ids = idx_it->second;
+            std::size_t i = 0;
+            while (i < ids.size() && to_fill > 0) {
+                auto oit = orders_.find(ids[i]);
+                if (oit == orders_.end()) {
+                    ids[i] = ids.back();
+                    ids.pop_back();
+                    continue;
+                }
+                TrackedOrder& o = oit->second;
                 if (o.qty <= to_fill) {
                     to_fill -= o.qty;
                     lit->second.order_count--;
-                    oit = orders_.erase(oit);
+                    orders_.erase(oit);
+                    ids[i] = ids.back();
+                    ids.pop_back();
                 } else {
                     o.qty -= to_fill;
                     to_fill = 0;
+                    ++i;
                 }
-            } else {
-                ++oit;
             }
+            if (ids.empty()) idx_map.erase(idx_it);
         }
+
         if (qty_remaining == 0)
-            map.erase(lit);
+            level_map.erase(lit);
     };
-    if (side == 0) do_execute(bids_);
-    else           do_execute(asks_);
+    if (side == 0) do_execute(bids_, bid_order_idx_);
+    else           do_execute(asks_, ask_order_idx_);
 }
 
 void OrderBook::on_cancel(uint64_t order_id) {
-    if (orders_.find(order_id) == orders_.end())
-        return;
+    auto oit = orders_.find(order_id);
+    if (oit == orders_.end()) return;
 
-    TrackedOrder order = orders_[order_id];
+    TrackedOrder order = oit->second;
     uint8_t side = order.side;
 
-    PriceLevel &level = (side == 0) ? bids_[order.price] : asks_[order.price];
-    level.total_qty -= order.qty;
-    level.order_count--;
+    auto erase_from_level = [&](auto& level_map) {
+        auto lit = level_map.find(order.price);
+        if (lit != level_map.end()) {
+            lit->second.total_qty -= order.qty;
+            lit->second.order_count--;
+            if (lit->second.total_qty <= 0)
+                level_map.erase(lit);
+        }
+    };
 
-    if (level.total_qty == 0) {
-        (side == 0) ? bids_.erase(order.price) : asks_.erase(order.price);
+    if (side == 0) erase_from_level(bids_);
+    else           erase_from_level(asks_);
+
+    auto& idx_map = (side == 0) ? bid_order_idx_ : ask_order_idx_;
+    auto idx_it = idx_map.find(order.price);
+    if (idx_it != idx_map.end()) {
+        auto& ids = idx_it->second;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] == order_id) {
+                ids[i] = ids.back();
+                ids.pop_back();
+                break;
+            }
+        }
+        if (ids.empty()) idx_map.erase(idx_it);
     }
-    orders_.erase(order_id);
+
+    orders_.erase(oit);
 }
 
 void OrderBook::clear() {
     bids_.clear();
     asks_.clear();
     orders_.clear();
+    bid_order_idx_.clear();
+    ask_order_idx_.clear();
 }
 
 

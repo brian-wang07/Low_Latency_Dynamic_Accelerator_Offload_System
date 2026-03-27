@@ -15,11 +15,12 @@
 #include "config.hpp"
 
 struct LiveOrder {
-    uint64_t order_id;
-    Side     side;
-    int64_t  price;
-    int64_t  qty;
-    double   expiry_time;
+    uint64_t    order_id;
+    Side        side;
+    int64_t     price;
+    int64_t     qty;
+    double      expiry_time;
+    std::size_t ids_idx;      // index into live_order_ids_ for O(1) removal
 };
 
 struct ExpiryEntry {
@@ -47,14 +48,20 @@ private:
     bool     in_burst_        = false;
     size_t   burst_remaining_ = 0;
 
-    std::vector<double> hawkes_bid_times_;
-    std::vector<double> hawkes_ask_times_;
+    // Incremental Hawkes sums: S = Σ exp(-β·(t - tᵢ)), updated at hawkes_sum_time_
+    double   hawkes_bid_sum_  = 0.0;
+    double   hawkes_ask_sum_  = 0.0;
+    double   hawkes_sum_time_ = 0.0;
     double   pending_hawkes_time_;
     Side     pending_hawkes_side_;
 
     std::map<int64_t, int64_t, std::greater<int64_t>> bid_levels_;
     std::map<int64_t, int64_t>                         ask_levels_;
     std::unordered_map<uint64_t, LiveOrder>             live_orders_;
+    std::vector<uint64_t>                               live_order_ids_; // for O(1) random cancel
+    // price -> [order_ids] index for O(1) lookup during matching
+    std::unordered_map<int64_t, std::vector<uint64_t>> bid_order_idx_;
+    std::unordered_map<int64_t, std::vector<uint64_t>> ask_order_idx_;
     std::priority_queue<ExpiryEntry, std::vector<ExpiryEntry>,
                         std::greater<ExpiryEntry>>      expiry_queue_;
 
@@ -68,7 +75,7 @@ private:
     int64_t  compute_best_ask() const;
     double   hawkes_intensity_at(Side side, double t) const;
     void     generate_next_hawkes();
-    void     prune_hawkes_history();
+    void     advance_hawkes_sums(double t);
     void     step_processes(double dt);
     int64_t  sample_limit_price(Side side);
     int64_t  sample_marketable_limit_price(Side side);

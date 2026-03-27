@@ -47,18 +47,22 @@ void DataGenerator::update_burst() {
     }
 }
 
-// Hawkes intensity: λ(t) = μ₀ + Σ α·exp(−β·(t − tᵢ))
-double DataGenerator::hawkes_intensity_at(Side side, double t) const {
-    double lam    = in_burst_ ? cfg_.hawkes_mu0 * cfg_.burst_rate_multiplier : cfg_.hawkes_mu0;
-    double cutoff = 10.0 / cfg_.hawkes_beta;
-    const auto& times = (side == Side::BID) ? hawkes_bid_times_ : hawkes_ask_times_;
-    for (auto it = times.rbegin(); it != times.rend(); ++it) {
-        double dt = t - *it;
-        if (dt < 0) continue;
-        if (dt > cutoff) break;   // sorted — remaining are older
-        lam += cfg_.hawkes_alpha * std::exp(-cfg_.hawkes_beta * dt);
+// Advance running Hawkes sums to time t (exponential decay, no new event)
+void DataGenerator::advance_hawkes_sums(double t) {
+    if (t > hawkes_sum_time_) {
+        double decay = std::exp(-cfg_.hawkes_beta * (t - hawkes_sum_time_));
+        hawkes_bid_sum_ *= decay;
+        hawkes_ask_sum_ *= decay;
+        hawkes_sum_time_ = t;
     }
-    return lam;
+}
+
+// Hawkes intensity: λ(t) = μ₀ + α·S(t), evaluated via decay from last update — O(1)
+double DataGenerator::hawkes_intensity_at(Side side, double t) const {
+    double base = in_burst_ ? cfg_.hawkes_mu0 * cfg_.burst_rate_multiplier : cfg_.hawkes_mu0;
+    double decay = std::exp(-cfg_.hawkes_beta * (t - hawkes_sum_time_));
+    double sum = (side == Side::BID) ? hawkes_bid_sum_ : hawkes_ask_sum_;
+    return base + cfg_.hawkes_alpha * sum * decay;
 }
 
 // Ogata thinning: propose dt ~ Exp(λ̄), accept with prob λ(t)/λ̄
@@ -83,16 +87,6 @@ void DataGenerator::generate_next_hawkes() {
         }
         lam_bar = lam + cfg_.hawkes_alpha;  // tighten bound on reject
     }
-}
-
-void DataGenerator::prune_hawkes_history() {
-    double cutoff = current_time_ - 10.0 / cfg_.hawkes_beta;
-    auto prune = [cutoff](std::vector<double>& v) {
-        auto it = std::lower_bound(v.begin(), v.end(), cutoff);
-        if (it != v.begin()) v.erase(v.begin(), it);
-    };
-    prune(hawkes_bid_times_);
-    prune(hawkes_ask_times_);
 }
 
 // OU mid:    μ(t+Δt) = μ + κ(μ₀ − μ)Δt + σ_eff·√Δt·Z
@@ -127,14 +121,16 @@ int64_t DataGenerator::sample_limit_price(Side side) {
 
     if (side == Side::BID) {
         int64_t price = compute_best_bid() - static_cast<int64_t>(delta) * tick_fp;
-        if (!ask_levels_.empty())
-            price = std::min(price, ask_levels_.begin()->first - tick_fp);
-        return price;
+        int64_t ceiling = ask_levels_.empty()
+            ? compute_best_ask() - tick_fp
+            : ask_levels_.begin()->first - tick_fp;
+        return std::min(price, ceiling);
     } else {
         int64_t price = compute_best_ask() + static_cast<int64_t>(delta) * tick_fp;
-        if (!bid_levels_.empty())
-            price = std::max(price, bid_levels_.begin()->first + tick_fp);
-        return price;
+        int64_t floor = bid_levels_.empty()
+            ? compute_best_bid() + tick_fp
+            : bid_levels_.begin()->first + tick_fp;
+        return std::max(price, floor);
     }
 }
 
@@ -157,9 +153,17 @@ int64_t DataGenerator::sample_qty() {
 }
 
 void DataGenerator::add_live_order(const LiveOrder& order) {
-    live_orders_[order.order_id] = order;
-    if (order.side == Side::BID) bid_levels_[order.price] += order.qty;
-    else                          ask_levels_[order.price] += order.qty;
+    LiveOrder lo = order;
+    lo.ids_idx = live_order_ids_.size();
+    live_orders_[lo.order_id] = lo;
+    live_order_ids_.push_back(lo.order_id);
+    if (lo.side == Side::BID) {
+        bid_levels_[lo.price] += lo.qty;
+        bid_order_idx_[lo.price].push_back(lo.order_id);
+    } else {
+        ask_levels_[lo.price] += lo.qty;
+        ask_order_idx_[lo.price].push_back(lo.order_id);
+    }
 }
 
 void DataGenerator::remove_live_order(uint64_t order_id) {
@@ -167,18 +171,48 @@ void DataGenerator::remove_live_order(uint64_t order_id) {
     if (it == live_orders_.end()) return;
     auto& o = it->second;
 
+    // O(1) swap-and-pop from live_order_ids_
+    std::size_t idx = o.ids_idx;
+    if (idx < live_order_ids_.size()) {
+        uint64_t back_id = live_order_ids_.back();
+        live_order_ids_[idx] = back_id;
+        live_order_ids_.pop_back();
+        if (back_id != order_id) {
+            auto back_it = live_orders_.find(back_id);
+            if (back_it != live_orders_.end())
+                back_it->second.ids_idx = idx;
+        }
+    }
+
+    auto erase_from_idx = [&](auto& idx_map) {
+        auto idx_it = idx_map.find(o.price);
+        if (idx_it != idx_map.end()) {
+            auto& ids = idx_it->second;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (ids[i] == order_id) {
+                    ids[i] = ids.back();
+                    ids.pop_back();
+                    break;
+                }
+            }
+            if (ids.empty()) idx_map.erase(idx_it);
+        }
+    };
+
     if (o.side == Side::BID) {
         auto lit = bid_levels_.find(o.price);
         if (lit != bid_levels_.end()) {
             lit->second -= o.qty;
             if (lit->second <= 0) bid_levels_.erase(lit);
         }
+        erase_from_idx(bid_order_idx_);
     } else {
         auto lit = ask_levels_.find(o.price);
         if (lit != ask_levels_.end()) {
             lit->second -= o.qty;
             if (lit->second <= 0) ask_levels_.erase(lit);
         }
+        erase_from_idx(ask_order_idx_);
     }
     live_orders_.erase(it);
 }
@@ -186,6 +220,23 @@ void DataGenerator::remove_live_order(uint64_t order_id) {
 // Walk opposite side from best level, emit EXECUTE events, apply price impact.
 void DataGenerator::match_market_order(Side aggressor_side, int64_t qty, uint64_t ts_ns) {
     Side passive_side = (aggressor_side == Side::BID) ? Side::ASK : Side::BID;
+    auto& idx_map = (passive_side == Side::BID) ? bid_order_idx_ : ask_order_idx_;
+
+    auto erase_live = [&](uint64_t oid) {
+        auto oit = live_orders_.find(oid);
+        if (oit == live_orders_.end()) return;
+        std::size_t idx = oit->second.ids_idx;
+        if (idx < live_order_ids_.size()) {
+            uint64_t back_id = live_order_ids_.back();
+            live_order_ids_[idx] = back_id;
+            live_order_ids_.pop_back();
+            if (back_id != oid) {
+                auto bit = live_orders_.find(back_id);
+                if (bit != live_orders_.end()) bit->second.ids_idx = idx;
+            }
+        }
+        live_orders_.erase(oit);
+    };
 
     auto walk_levels = [&](auto& levels) {
         int64_t remaining    = qty;
@@ -210,21 +261,29 @@ void DataGenerator::match_market_order(Side aggressor_side, int64_t qty, uint64_
             exec.qty_remaining = level_qty - fill;
             pending_events_.push_back(make_event(exec, 0));
 
-            // Remove filled live orders at this level
+            // Remove filled live orders at this level using price index
             int64_t to_fill = fill;
-            std::vector<uint64_t> to_remove;
-            for (auto& [oid, lo] : live_orders_) {
-                if (lo.side != passive_side || lo.price != level_price) continue;
-                if (to_fill >= lo.qty) {
-                    to_fill -= lo.qty;
-                    to_remove.push_back(oid);
-                } else {
-                    lo.qty -= to_fill;
-                    to_fill = 0;
+            auto idx_it = idx_map.find(level_price);
+            if (idx_it != idx_map.end()) {
+                auto& ids = idx_it->second;
+                std::size_t i = 0;
+                while (i < ids.size() && to_fill > 0) {
+                    auto oit = live_orders_.find(ids[i]);
+                    if (oit == live_orders_.end()) {
+                        ids[i] = ids.back(); ids.pop_back(); continue;
+                    }
+                    if (to_fill >= oit->second.qty) {
+                        to_fill -= oit->second.qty;
+                        erase_live(ids[i]);
+                        ids[i] = ids.back(); ids.pop_back();
+                    } else {
+                        oit->second.qty -= to_fill;
+                        to_fill = 0;
+                        ++i;
+                    }
                 }
-                if (to_fill <= 0) break;
+                if (ids.empty()) idx_map.erase(idx_it);
             }
-            for (uint64_t oid : to_remove) live_orders_.erase(oid);
 
             it->second -= fill;
             if (it->second <= 0) levels.erase(it);
@@ -243,6 +302,23 @@ int64_t DataGenerator::match_limit_order(
     Side aggressor_side, int64_t limit_price, int64_t qty, uint64_t ts_ns)
 {
     Side passive_side = (aggressor_side == Side::BID) ? Side::ASK : Side::BID;
+    auto& idx_map = (passive_side == Side::BID) ? bid_order_idx_ : ask_order_idx_;
+
+    auto erase_live = [&](uint64_t oid) {
+        auto oit = live_orders_.find(oid);
+        if (oit == live_orders_.end()) return;
+        std::size_t idx = oit->second.ids_idx;
+        if (idx < live_order_ids_.size()) {
+            uint64_t back_id = live_order_ids_.back();
+            live_order_ids_[idx] = back_id;
+            live_order_ids_.pop_back();
+            if (back_id != oid) {
+                auto bit = live_orders_.find(back_id);
+                if (bit != live_orders_.end()) bit->second.ids_idx = idx;
+            }
+        }
+        live_orders_.erase(oit);
+    };
 
     auto walk_levels = [&](auto& levels) -> int64_t {
         int64_t remaining    = qty;
@@ -273,19 +349,27 @@ int64_t DataGenerator::match_limit_order(
             pending_events_.push_back(make_event(exec, 0));
 
             int64_t to_fill = fill;
-            std::vector<uint64_t> to_remove;
-            for (auto& [oid, lo] : live_orders_) {
-                if (lo.side != passive_side || lo.price != level_price) continue;
-                if (to_fill >= lo.qty) {
-                    to_fill -= lo.qty;
-                    to_remove.push_back(oid);
-                } else {
-                    lo.qty -= to_fill;
-                    to_fill = 0;
+            auto idx_it = idx_map.find(level_price);
+            if (idx_it != idx_map.end()) {
+                auto& ids = idx_it->second;
+                std::size_t i = 0;
+                while (i < ids.size() && to_fill > 0) {
+                    auto oit = live_orders_.find(ids[i]);
+                    if (oit == live_orders_.end()) {
+                        ids[i] = ids.back(); ids.pop_back(); continue;
+                    }
+                    if (to_fill >= oit->second.qty) {
+                        to_fill -= oit->second.qty;
+                        erase_live(ids[i]);
+                        ids[i] = ids.back(); ids.pop_back();
+                    } else {
+                        oit->second.qty -= to_fill;
+                        to_fill = 0;
+                        ++i;
+                    }
                 }
-                if (to_fill <= 0) break;
+                if (ids.empty()) idx_map.erase(idx_it);
             }
-            for (uint64_t oid : to_remove) live_orders_.erase(oid);
 
             it->second -= fill;
             if (it->second <= 0) levels.erase(it);
@@ -376,10 +460,9 @@ GeneratedEvent DataGenerator::next() {
     step_processes(dt);
     current_time_ = event_time;
 
-    if (event_side == Side::BID) hawkes_bid_times_.push_back(current_time_);
-    else                          hawkes_ask_times_.push_back(current_time_);
-    if ((hawkes_bid_times_.size() + hawkes_ask_times_.size()) % 200 == 0)
-        prune_hawkes_history();
+    advance_hawkes_sums(current_time_);
+    if (event_side == Side::BID) hawkes_bid_sum_ += 1.0;
+    else                          hawkes_ask_sum_ += 1.0;
 
     update_burst();
     generate_next_hawkes();
@@ -427,8 +510,9 @@ GeneratedEvent DataGenerator::next() {
         break;
     }
     case EventType::CANCEL: {
-        auto it = live_orders_.begin();
-        std::advance(it, std::uniform_int_distribution<size_t>(0, live_orders_.size()-1)(rng_));
+        size_t idx = std::uniform_int_distribution<size_t>(0, live_order_ids_.size()-1)(rng_);
+        uint64_t oid = live_order_ids_[idx];
+        auto it = live_orders_.find(oid);
         ev.order_id      = it->second.order_id;
         ev.type          = EventType::CANCEL;
         ev.side          = it->second.side;
@@ -459,12 +543,30 @@ GeneratedEvent DataGenerator::next() {
         int64_t residual = match_limit_order(event_side, ev.price, ev.qty, ev.timestamp_ns);
 
         if (residual > 0) {
+            // Clamp residual price so it doesn't cross the book.
+            // After matching, the opposite side may have been partially
+            // consumed; place the residual at the new BBO, not the
+            // original marketable price.
+            int64_t tick_fp = to_fixed(cfg_.tick_size);
+            int64_t rest_price = ev.price;
+            if (event_side == Side::BID) {
+                int64_t new_best_ask = ask_levels_.empty()
+                    ? compute_best_ask()
+                    : ask_levels_.begin()->first;
+                rest_price = std::min(rest_price, new_best_ask - tick_fp);
+            } else {
+                int64_t new_best_bid = bid_levels_.empty()
+                    ? compute_best_bid()
+                    : bid_levels_.begin()->first;
+                rest_price = std::max(rest_price, new_best_bid + tick_fp);
+            }
+
             OrderEvent add_ev{};
             add_ev.timestamp_ns  = ev.timestamp_ns;
             add_ev.order_id      = next_order_id_++;
             add_ev.type          = EventType::ADD_LIMIT;
             add_ev.side          = event_side;
-            add_ev.price         = ev.price;
+            add_ev.price         = rest_price;
             add_ev.qty           = residual;
             add_ev.qty_remaining = residual;
 

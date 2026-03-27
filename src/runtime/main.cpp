@@ -15,14 +15,15 @@ int main() {
 
     alignas(64) BookSnapshot snapshot{};
 
-    DisplayThread display;
-    std::thread display_thread([&] {
-        display.run(snapshot, g_running);
+    RuntimeEngine<> engine;
+    std::thread engine_thread([&] {
+        engine.run(g_running, snapshot);
     });
 
-    RuntimeEngine<> engine;           // NoOpHandler by default
-    engine.run(g_running, snapshot);  // main thread = hot path
+    DisplayThread display;
+    display.run(snapshot, g_running);  // main thread = UI (macOS requirement)
 
-    display_thread.join();
+    g_running = 0;
+    engine_thread.join();
     return 0;
 }

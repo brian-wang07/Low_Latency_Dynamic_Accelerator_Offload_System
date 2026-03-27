@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
-project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX)
+
+# On macOS, Apple Clang is required for Objective-C++ (GLFW/Cocoa headers).
+# Homebrew GCC cannot parse macOS SDK Objective-C extensions.
+if(APPLE AND NOT DEFINED CMAKE_CXX_COMPILER)
+    find_program(APPLE_CLANGXX NAMES clang++ PATHS /usr/bin NO_DEFAULT_PATH)
+    if(APPLE_CLANGXX)
+        set(CMAKE_CXX_COMPILER "${APPLE_CLANGXX}")
+        set(CMAKE_OBJCXX_COMPILER "${APPLE_CLANGXX}")
+    endif()
+endif()
+
+project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX OBJCXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -13,7 +24,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
-find_package(glfw3 3.3 REQUIRED)
+find_package(glfw3 3.4 REQUIRED)
 find_package(OpenGL REQUIRED)
 
 add_library(imgui_lib STATIC
@@ -29,6 +40,16 @@ target_include_directories(imgui_lib PUBLIC
     ${imgui_SOURCE_DIR}/backends
 )
 target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+
+# On macOS, GLFW headers pull in Cocoa which uses Objective-C blocks (^).
+# Compile the GLFW and OpenGL backends as Objective-C++ to handle this.
+if(APPLE)
+    set_source_files_properties(
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+        PROPERTIES LANGUAGE OBJCXX
+    )
+endif()
 
 # Use C++23
 set(CMAKE_CXX_STANDARD 23)

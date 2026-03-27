@@ -4,6 +4,7 @@
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 struct PriceLevel {
     int64_t  price;
@@ -43,5 +44,9 @@ private:
     std::map<int64_t, PriceLevel, std::greater<>> bids_; //descending order; begin() = best bid (highest)
     std::map<int64_t, PriceLevel>                 asks_; //ascending order; begin() = best ask (lowest)
     std::unordered_map<uint64_t, TrackedOrder>    orders_;
+
+    // price -> [order_ids] index for O(1) lookup in on_execute
+    std::unordered_map<int64_t, std::vector<uint64_t>> bid_order_idx_;
+    std::unordered_map<int64_t, std::vector<uint64_t>> ask_order_idx_;
 };
 
