@@ -71,10 +71,13 @@ private:
     void     prune_hawkes_history();
     void     step_processes(double dt);
     int64_t  sample_limit_price(Side side);
+    int64_t  sample_marketable_limit_price(Side side);
     int64_t  sample_qty();
     void     add_live_order(const LiveOrder& order);
     void     remove_live_order(uint64_t order_id);
     void     match_market_order(Side aggressor_side, int64_t qty, uint64_t ts_ns);
+    int64_t  match_limit_order(Side aggressor_side, int64_t limit_price,
+                               int64_t qty, uint64_t ts_ns);
     void     apply_price_impact(Side aggressor_side, int64_t fill_qty);
     GeneratedEvent make_event(OrderEvent ev, uint64_t wait_ps) const;
 };

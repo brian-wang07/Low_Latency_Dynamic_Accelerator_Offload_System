@@ -5,9 +5,41 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Threads REQUIRED)
 
+include(FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.6
+)
+FetchContent_MakeAvailable(imgui)
+
+find_package(glfw3 3.3 REQUIRED)
+find_package(OpenGL REQUIRED)
+
+add_library(imgui_lib STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui_lib PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+
 # Use C++23
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# librt is needed on Linux for shm_open; macOS has it in libc
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(RT_LIB rt)
+else()
+    set(RT_LIB "")
+endif()
 
 # Add common includes
 add_library(common STATIC src/common/shm_manager.cpp)
@@ -21,11 +53,11 @@ target_link_libraries(data_generator_lib PUBLIC common)
 # Process 1: Data Simulator
 add_executable(data_sim src/data/main.cpp)
 target_compile_definitions(data_sim PRIVATE PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
-target_link_libraries(data_sim PRIVATE data_generator_lib Threads::Threads rt)
+target_link_libraries(data_sim PRIVATE data_generator_lib Threads::Threads ${RT_LIB})
 
 # Tests
 add_executable(data_test src/tests/data.cpp)
-target_link_libraries(data_test PRIVATE data_generator_lib Threads::Threads rt)
+target_link_libraries(data_test PRIVATE data_generator_lib Threads::Threads ${RT_LIB})
 
 # Order book test
 add_executable(order_book_test src/tests/order_book_test.cpp src/runtime/order_book.cpp)
@@ -34,10 +66,15 @@ target_include_directories(order_book_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
 
 # Process 2: Runtime Engine
-add_executable(runtime_engine src/runtime/main.cpp src/runtime/runtime_engine.cpp src/runtime/order_book.cpp)
+add_executable(runtime_engine
+    src/runtime/main.cpp
+    src/runtime/runtime_engine.cpp
+    src/runtime/order_book.cpp
+    src/runtime/display_thread.cpp
+)
 target_include_directories(runtime_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
-target_link_libraries(runtime_engine PRIVATE common Threads::Threads rt)
+target_link_libraries(runtime_engine PRIVATE common Threads::Threads ${RT_LIB} imgui_lib)
 
 # Process 3: Accelerator Simulator
 add_executable(accelerator_sim src/accelerator/main.cpp)
-target_link_libraries(accelerator_sim PRIVATE common Threads::Threads rt)
+target_link_libraries(accelerator_sim PRIVATE common Threads::Threads ${RT_LIB})

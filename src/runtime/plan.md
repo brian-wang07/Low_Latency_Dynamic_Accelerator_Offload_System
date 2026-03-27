@@ -1,235 +1,358 @@
-# Order Book Reconstruction — Runtime Engine Plan
+# Plan: Dual-Thread Engine + ImGui Display Refactor
 
 ## Context
 
-The data generator streams realistic events (ADD_LIMIT, CANCEL, ADD_MARKET, EXECUTE) but the shared memory only passes aggregate BBO snapshots (`MarketData`). The runtime cannot reconstruct a limit order book from this. We need to:
-
-1. Stream full event data via a SPSC ring buffer in shared memory
-2. Build a limit order book on the runtime side
-3. Expose clean interfaces for future GUI and Grafana-style dashboards
+The runtime engine currently calls `printf` + `fflush(stdout)` every 64 events from the hot-path polling loop. On high-rate configs (eth_perpetual_futures), this causes tick rate to decay from ~7k/s to ~300/s — terminal I/O is blocking the spin loop. The fix is to move all display off the hot path entirely, publishing a seqlock snapshot that a separate ImGui thread reads at 60fps. Alongside this, the engine is refactored into a clean orchestrator that exposes a zero-overhead user-defined processing interface via C++23 concepts.
 
 ---
 
-## 1. SPSC Event Ring Buffer in Shared Memory
+## Phase 1: Fill in `book_snapshot.hpp`
 
-### Problem
-`MarketData` has no `order_id`, per-order `qty`, or per-order `price`. The runtime needs the full `OrderEvent` stream.
+**File:** `src/runtime/book_snapshot.hpp` (currently empty)
 
-### Design
-
-**File**: `src/common/shm_types.hpp`
+Add a seqlock-protected snapshot struct that the hot path writes and the display thread reads:
 
 ```cpp
-struct alignas(64) ShmOrderEvent {
-    uint64_t sequence;        // monotonic; 0 = unwritten
-    uint64_t timestamp_ns;
-    uint64_t order_id;
-    int64_t  price;           // the ORDER's quoted price, fixed-point × PRICE_SCALE
-                              // (limit price for ADD_LIMIT/CANCEL, fill price for EXECUTE, 0 for ADD_MARKET)
-                              // this is ev.price — NOT the mid price
-    int64_t  qty;
-    int64_t  qty_remaining;
-    uint8_t  type;            // EventType enum
-    uint8_t  side;            // Side enum
-    uint8_t  _pad[6];
-};
-static_assert(sizeof(ShmOrderEvent) == 64);
+#pragma once
+#include <atomic>
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include "order_book.hpp"   // PriceLevel
 
-inline constexpr uint32_t EVENT_RING_CAPACITY = 8192; // power of 2
-inline constexpr uint32_t EVENT_RING_MASK     = EVENT_RING_CAPACITY - 1;
-
-struct alignas(64) EventRingBuffer {
-    alignas(64) std::atomic<uint64_t> head;   // producer-owned
-    alignas(64) std::atomic<uint64_t> tail;   // consumer-owned
-    alignas(64) ShmOrderEvent slots[EVENT_RING_CAPACITY];
-};
-```
-
-**Size**: 128B metadata + 64 × 8192 = ~512 KB. Fits within 1 MB SHM.
-
-**Memory ordering (SPSC)**:
-- Producer: write slot fields (relaxed), then `head.store(h+1, release)`
-- Consumer: `head.load(acquire)`, read slot (relaxed), then `tail.store(t+1, release)`
-- Producer checks `head - tail.load(acquire) < CAPACITY` for back-pressure
-
-**Keep `MarketData`**: Yes — burst detection/EMA/accelerator batching depend on it. `MarketData` = lossy latest snapshot (mid price, BBO). `EventRingBuffer` = lossless ordered stream (per-order quoted prices).
-
-**Updated `SharedMemoryBlock`**: Add `alignas(64) EventRingBuffer event_ring;` field. Bump `SHM_VERSION` to 2.
-
-### Data generator changes
-
-**File**: `src/data/main.cpp` — after existing `MarketData` stores, write each event to the ring buffer. The price written to the ring must be `ev.price` (the order's quoted price), NOT `ge.mid`:
-
-```cpp
-slot.price = ev.price;  // order's quoted limit/fill price — NOT mid
-```
-
-This means:
-- ADD_LIMIT: the limit price the order was placed at
-- CANCEL: the price of the order being cancelled
-- EXECUTE: the price level where the fill occurred
-- ADD_MARKET: 0 (market orders have no quoted price)
-
-The existing `MarketData.price` field continues to carry the mid price for EMA/burst detection — these are two separate data paths.
-
-**File**: `src/data/data_generator.cpp` line 186 — EXECUTE events currently have `order_id = 0` because fills are level-aggregate (one EXECUTE per price level, not per order). **Keep this as-is.** The order book will handle EXECUTE as level-aggregate decrements. Individual orders at filled levels become stale in the order map and get cleaned up on subsequent CANCEL attempts (silently ignored if order not found).
-
----
-
-## 2. Order Book Data Structure
-
-### Design rationale
-The runtime is single-threaded and is an event consumer, not a matching engine. No lock-free book internals needed — simple STL containers, atomics only at the SHM boundary (already handled by the ring buffer).
-
-### Files: `src/runtime/order_book.hpp`, `src/runtime/order_book.cpp`
-
-```cpp
-struct PriceLevel {
-    int64_t  price;        // fixed-point — the quoted price at this level
-    int64_t  total_qty;
-    uint32_t order_count;
-};
-
-struct TrackedOrder {
-    uint64_t order_id;
-    uint8_t  side;
-    int64_t  price;        // the order's quoted limit price
-    int64_t  qty;
-};
-
-class OrderBook {
-public:
-    // Event processing
-    void on_add_limit(uint64_t order_id, uint8_t side, int64_t price, int64_t qty);
-    void on_cancel(uint64_t order_id);
-    void on_execute(uint8_t side, int64_t price, int64_t qty, int64_t qty_remaining);
-
-    // Queries
-    int64_t  best_bid() const;
-    int64_t  best_ask() const;
-    int64_t  spread() const;
-    double   bid_ask_imbalance(size_t levels = 1) const;
-    double   volume_weighted_mid(size_t levels = 3) const;
-
-    // Depth (returns up to max_levels)
-    size_t bid_depth(PriceLevel* out, size_t max_levels) const;
-    size_t ask_depth(PriceLevel* out, size_t max_levels) const;
-
-    uint64_t total_bid_qty() const;
-    uint64_t total_ask_qty() const;
-
-private:
-    std::map<int64_t, PriceLevel, std::greater<>> bids_;  // highest first → begin() = best bid
-    std::map<int64_t, PriceLevel>                 asks_;  // lowest first  → begin() = best ask
-    std::unordered_map<uint64_t, TrackedOrder>    orders_;
-};
-```
-
-### Event processing logic
-
-- **on_add_limit**: Insert into `orders_` keyed by `order_id`. Find-or-create `PriceLevel` at the order's quoted price, increment qty/count.
-- **on_cancel**: Lookup `order_id` in `orders_`. Use the stored quoted price to find the level. Decrement level qty/count. Erase level if qty=0. Erase from `orders_`. Silently ignore if order_id not found (already filled).
-- **on_execute**: Level-aggregate: decrement `total_qty` at the fill price level by `qty`. If `qty_remaining == 0`, erase level. Walk `orders_` at that price to remove filled orders (FIFO, decrement `to_fill` until exhausted). This matches the generator's `walk_levels` logic.
-- **on_add_market**: No-op. Subsequent EXECUTEs handle fills.
-
----
-
-## 3. Snapshot Interface (for GUI / Metrics Threads)
-
-### File: `src/runtime/book_snapshot.hpp`
-
-Seqlock-published snapshot — written by poll thread, read by any observer thread.
-
-```cpp
-constexpr size_t SNAPSHOT_DEPTH = 10;
-
-struct BookLevel {
-    int64_t  price;        // quoted price at this level
-    int64_t  total_qty;
-    uint32_t order_count;
-};
+inline constexpr std::size_t SNAPSHOT_DEPTH = 8;
 
 struct alignas(64) BookSnapshot {
-    std::atomic<uint64_t> version;  // seqlock: odd = writing, even = stable
+    std::atomic<uint64_t> version{0};   // odd = being written; even = stable
 
-    int64_t best_bid, best_ask, spread;
-    BookLevel bids[SNAPSHOT_DEPTH];
-    BookLevel asks[SNAPSHOT_DEPTH];
-    uint32_t bid_level_count, ask_level_count;
-    int64_t  total_bid_qty, total_ask_qty;
-    double   imbalance;
-    double   vwap_mid;
-    uint64_t event_sequence;
-    uint64_t snapshot_time_ns;
+    int64_t  best_bid{0};
+    int64_t  best_ask{0};
+    int64_t  spread{0};
+    uint64_t total_bid_qty{0};
+    uint64_t total_ask_qty{0};
+    double   imbalance{0.0};
+    double   vwmid{0.0};              // already divided by PRICE_SCALE
+    int64_t  ema{0};
+    double   tick_rate{0.0};
+    bool     in_burst{false};
+
+    PriceLevel bids[SNAPSHOT_DEPTH]{};
+    PriceLevel asks[SNAPSHOT_DEPTH]{};
+    uint32_t   bid_level_count{0};
+    uint32_t   ask_level_count{0};
+
+    uint64_t event_sequence{0};
+};
+
+// Writer helpers (hot-path thread only)
+inline void snapshot_begin_write(BookSnapshot& s) noexcept {
+    s.version.fetch_add(1, std::memory_order_release);  // -> odd
+}
+inline void snapshot_end_write(BookSnapshot& s) noexcept {
+    s.version.fetch_add(1, std::memory_order_release);  // -> even
+}
+
+// Reader (display thread) — returns false if snapshot is unstable or uninitialized
+inline bool snapshot_read(const BookSnapshot& src, BookSnapshot& out) noexcept {
+    for (int i = 0; i < 64; ++i) {
+        uint64_t v1 = src.version.load(std::memory_order_acquire);
+        if (v1 & 1u) continue;
+        std::memcpy(
+            reinterpret_cast<char*>(&out) + sizeof(std::atomic<uint64_t>),
+            reinterpret_cast<const char*>(&src) + sizeof(std::atomic<uint64_t>),
+            sizeof(BookSnapshot) - sizeof(std::atomic<uint64_t>));
+        uint64_t v2 = src.version.load(std::memory_order_acquire);
+        if (v1 == v2) return v1 > 0;
+    }
+    return false;  // contention; caller renders with stale local copy
+}
+```
+
+The hot path writes between the two `fetch_add` calls using normal stores. The display thread retries on contention but never blocks the engine — it renders the previous frame's data if it can't acquire a stable read.
+
+---
+
+## Phase 2: User Processing Interface (`EventHandler` concept)
+
+**File:** `src/runtime/runtime_engine.hpp` — add before the `RuntimeEngine` class definition
+
+```cpp
+#include <concepts>
+
+struct ProcessedEvent {
+    uint64_t  sequence;
+    uint64_t  timestamp_ns;
+    EventType type;
+    Side      side;
+    int64_t   best_bid;       // fixed-point
+    int64_t   best_ask;       // fixed-point
+    int64_t   spread;         // fixed-point
+    int64_t   ema;            // fixed-point
+    double    tick_rate;
+    bool      in_burst;
+    BurstStats burst_stats;
+};
+
+template<typename T>
+concept EventHandler = requires(T& h, const ProcessedEvent& e) {
+    { h.on_event(e) } noexcept;
+};
+
+struct NoOpHandler {
+    void on_event(const ProcessedEvent&) noexcept {}
 };
 ```
 
-**Writer** (poll thread): `version.fetch_add(1, release)` → fill fields → `version.fetch_add(1, release)`
-
-**Reader** (GUI/metrics thread): spin-read until two consistent even reads of `version`.
-
-**Throttle**: Publish at most once per 64 events or 1μs, whichever first. During 5ns bursts, this avoids 200M snapshots/sec.
+`ProcessedEvent` intentionally omits depth arrays — walking the book maps per-event is expensive. Depth is only computed at snapshot-publish time (every 64 events). User code needing depth should consume the snapshot directly.
 
 ---
 
-## 4. Threading Model
+## Phase 3: Templatize `RuntimeEngine`
 
-**Recommendation: Inline book updates in the poll loop.** No second thread.
+**File:** `src/runtime/runtime_engine.hpp`
 
-- Book operations (~50-120ns per event) are fast enough for normal mode (50ns inter-arrival).
-- During bursts (5ns inter-arrival), the ring buffer absorbs the backlog. The runtime catches up between bursts.
-- A second thread adds latency (2 extra cache-line transfers per event) and complexity with no benefit at this stage.
-- The existing `MarketData` path for burst detection runs independently — it reads the latest BBO snapshot (mid price), not the ring.
+```cpp
+template<EventHandler Handler = NoOpHandler>
+class RuntimeEngine {
+public:
+    explicit RuntimeEngine(Handler handler = Handler{})
+        : handler_(std::move(handler)) {}
 
-### Modified poll loop structure
+    void run(volatile sig_atomic_t& running, BookSnapshot& snapshot);
 
+private:
+    ShmManager      shm_;
+    TickProcessor   processor_;
+    BurstDetector<> detector_;
+    OrderBook       book_;
+    Handler         handler_;
+
+    uint64_t last_ring_tail_        = 0;
+    engine::shm::AcceleratorTick pending_batch_[engine::shm::BATCH_SIZE]{};
+    uint32_t pending_count_         = 0;
+    uint64_t last_batch_seq_        = 0;
+    uint64_t last_result_seq_       = 0;
+    uint64_t prev_tick_received_at_ = 0;
+    bool     was_in_burst_          = false;
+
+    void flush_batch(engine::shm::SharedMemoryBlock* block, uint64_t seq);
+    void publish_snapshot(BookSnapshot& snap, uint64_t seq);
+};
 ```
-while (running):
-    // PATH 1: MarketData snapshot (existing, unchanged)
-    //   → cache, EMA, burst detection, accelerator batching
-    //   uses mid price from MarketData.price
 
-    // PATH 2: Event ring (NEW)
-    //   drain ring → book.on_add_limit / on_cancel / on_execute
-    //   uses per-order quoted prices from ShmOrderEvent.price
-    //   throttled snapshot publication
+Because `RuntimeEngine` is now a class template, `run()`, `flush_batch()`, and `publish_snapshot()` must be defined in the header as inline method bodies after the class. The `.cpp` file then retains only the non-template implementations: `TickProcessor` and `BurstDetector`.
 
-    // Pause only if both paths idle
-    if (no new MarketData && ring empty): _mm_pause()
+**`publish_snapshot()` inline in header:**
+
+```cpp
+template<EventHandler H>
+void RuntimeEngine<H>::publish_snapshot(BookSnapshot& snap, uint64_t seq) {
+    snapshot_begin_write(snap);
+    snap.best_bid        = book_.best_bid();
+    snap.best_ask        = book_.best_ask();
+    snap.spread          = book_.spread();
+    snap.total_bid_qty   = book_.total_bid_qty();
+    snap.total_ask_qty   = book_.total_ask_qty();
+    snap.imbalance       = book_.bid_ask_imbalance(3);
+    snap.vwmid           = book_.volume_weighted_mid(3) / PRICE_SCALE;
+    snap.ema             = processor_.ema();
+    snap.tick_rate       = processor_.tick_rate();
+    snap.in_burst        = detector_.in_burst();
+    snap.bid_level_count = (uint32_t)book_.bid_depth(snap.bids, SNAPSHOT_DEPTH);
+    snap.ask_level_count = (uint32_t)book_.ask_depth(snap.asks, SNAPSHOT_DEPTH);
+    snap.event_sequence  = seq;
+    snapshot_end_write(snap);
+}
+```
+
+Note: `volume_weighted_mid()` returns a `double` still in fixed-point units (prices are stored as `int64_t * PRICE_SCALE`). Dividing by `PRICE_SCALE` converts to display units — matching existing `print_book()` behavior.
+
+**Changes to `run()` inner loop:**
+
+- Replace `events_since_print` / `print_book()` with an `events_since_snapshot` counter → call `publish_snapshot(snapshot, slot.sequence)` every 64 events
+- Remove all `std::cout` lines from `flush_batch()` and the burst-exit/accelerator-result branches
+- After book dispatch + detector/processor updates, build and dispatch `ProcessedEvent`:
+
+```cpp
+ProcessedEvent pe{
+    .sequence     = slot.sequence,
+    .timestamp_ns = slot.timestamp_ns,
+    .type         = static_cast<EventType>(slot.type),
+    .side         = static_cast<Side>(slot.side),
+    .best_bid     = book_.best_bid(),
+    .best_ask     = book_.best_ask(),
+    .spread       = book_.spread(),
+    .ema          = processor_.ema(),
+    .tick_rate    = processor_.tick_rate(),
+    .in_burst     = burst_now,
+    .burst_stats  = detector_.stats(),
+};
+handler_.on_event(pe);
+```
+
+The compiler sees the full concrete type of `Handler` and inlines `on_event` completely — zero runtime dispatch overhead.
+
+---
+
+## Phase 4: `DisplayThread`
+
+**New file:** `src/runtime/display_thread.hpp`
+
+```cpp
+#pragma once
+#include <csignal>
+#include "book_snapshot.hpp"
+
+class DisplayThread {
+public:
+    void run(const BookSnapshot& snapshot, volatile sig_atomic_t& running);
+};
+```
+
+**New file:** `src/runtime/display_thread.cpp`
+
+Backend: **GLFW + OpenGL3** — cleanest CMake FetchContent integration, native WSLg support via Mesa.
+
+Render loop outline:
+1. `glfwInit()`, create window (900×500, "Order Book"), `glfwMakeContextCurrent`
+2. `ImGui::CreateContext()`, `ImGui_ImplGlfw_InitForOpenGL(window, true)`, `ImGui_ImplOpenGL3_Init("#version 330")`
+3. `glfwSwapInterval(1)` — vsync caps to ~60fps, no sleep needed
+4. Loop until `glfwWindowShouldClose || !running`:
+   - `glfwPollEvents()`
+   - `snapshot_read(src, local)` — non-blocking; render stale `local` on failure
+   - `ImGui_ImplOpenGL3_NewFrame()` / `ImGui_ImplGlfw_NewFrame()` / `ImGui::NewFrame()`
+   - `render_order_book(local)`
+   - `ImGui::Render()`, `glClear`, `ImGui_ImplOpenGL3_RenderDrawData`, `glfwSwapBuffers`
+5. Cleanup: ImGui shutdown → GLFW destroy/terminate
+
+`render_order_book(const BookSnapshot& s)`:
+- `ImGui::Begin("Order Book")`
+- Header: spread, imbalance, vwmid, EMA, tick rate, burst indicator (highlighted when `in_burst`)
+- `ImGui::BeginTable("book", 6)` columns: BID PRICE | QTY | ORD | ORD | QTY | ASK PRICE
+- 8 rows; bid cells styled green, ask cells styled red via `ImGui::PushStyleColor`
+- `ImGui::End()`
+
+ImGui contexts are not thread-safe — `DisplayThread` must be the only thread calling any `ImGui::` function. The hot-path thread never touches ImGui.
+
+---
+
+## Phase 5: `CMakeLists.txt` Changes
+
+Add after `find_package(Threads REQUIRED)`:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.6
+)
+FetchContent_MakeAvailable(imgui)
+
+find_package(glfw3 3.3 REQUIRED)
+find_package(OpenGL REQUIRED)
+
+add_library(imgui_lib STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(imgui_lib PUBLIC
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+)
+target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+```
+
+Update `runtime_engine` target:
+```cmake
+add_executable(runtime_engine
+    src/runtime/main.cpp
+    src/runtime/runtime_engine.cpp   # now only TickProcessor/BurstDetector impls
+    src/runtime/order_book.cpp
+    src/runtime/display_thread.cpp   # NEW
+)
+target_link_libraries(runtime_engine PRIVATE common Threads::Threads rt imgui_lib)
+```
+
+System packages (one-time):
+```
+sudo apt install libglfw3-dev libgl1-mesa-dev
 ```
 
 ---
 
-## 5. Rust vs C++ for Dashboard
+## Phase 6: Update `main.cpp`
 
-### Verdict: Stay with C++ for the MVP. Consider Rust later if the dashboard grows beyond metrics.
+```cpp
+#include <csignal>
+#include <thread>
+#include "runtime_engine.hpp"
+#include "display_thread.hpp"
+#include "book_snapshot.hpp"
 
-**For Prometheus metrics only** (Grafana-style):
-- **C++ with `prometheus-cpp`**: One process, one build system, direct `BookSnapshot` access via seqlock, no serialization. `prometheus-cpp` is battle-tested (used by Envoy, gRPC). Adds one dependency.
-- **Rust sidecar**: Must replicate all shared structs with `#[repr(C, align(64))]` — error-prone, must stay in sync. Two build systems (CMake + Cargo). Two binaries to deploy. The isolation benefit is real but solvable with CPU pinning.
+static volatile sig_atomic_t g_running = 1;
+static void handle_signal(int) { g_running = 0; }
 
-**When Rust becomes worth it**: If the dashboard grows to interactive order book visualization, WebSocket streaming, REST APIs for historical data — Rust's web ecosystem (`axum`, `tokio`) is genuinely better for that. At that point, consider using `bindgen` to auto-generate Rust bindings from C headers and `static_assert`/`const_assert!` on struct sizes.
+int main() {
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
-**For now**: Add `prometheus-cpp` to CMake, create a metrics thread in the runtime that reads `BookSnapshot` via seqlock and serves `/metrics`.
+    alignas(64) BookSnapshot snapshot{};
+
+    DisplayThread display;
+    std::thread display_thread([&] {
+        display.run(snapshot, g_running);
+    });
+
+    RuntimeEngine<> engine;           // NoOpHandler by default
+    engine.run(g_running, snapshot);  // main thread = hot path
+
+    display_thread.join();
+    return 0;
+}
+```
+
+The main thread becomes the engine (signal delivery is guaranteed on the main thread on Linux). The display thread owns the GLFW window and ImGui context. `snapshot` is the only shared mutable state between threads.
+
+Custom handler — user only modifies `main.cpp`:
+```cpp
+struct MyStrategy {
+    void on_event(const ProcessedEvent& e) noexcept {
+        // no I/O, no allocation, no locks
+        if (e.in_burst && e.spread < threshold) { /* ... */ }
+    }
+};
+RuntimeEngine<MyStrategy> engine{ MyStrategy{} };
+```
 
 ---
 
-## 6. Implementation Steps
+## File Summary
 
-| Step | Files | What |
-|------|-------|------|
-| 1 | `src/common/shm_types.hpp` | Add `ShmOrderEvent`, `EventRingBuffer`, update `SharedMemoryBlock`, bump version |
-| 2 | `src/data/main.cpp` | Write each event to the ring buffer (`ev.price`, not mid) after existing `MarketData` stores |
-| 3 | `src/runtime/order_book.hpp`, `order_book.cpp` | `OrderBook` class with maps, order tracking, event handlers |
-| 4 | `src/runtime/book_snapshot.hpp` | `BookSnapshot` seqlock struct and publish/read functions |
-| 5 | `src/runtime/runtime_engine.hpp/.cpp` | Add `OrderBook` + `BookSnapshot` members, ring consumption in poll loop |
-| 6 | `CMakeLists.txt` | Add `order_book.cpp` to `runtime_engine` target |
-| 7 | `src/tests/order_book_test.cpp` | Unit tests: known event sequences → verify BBO, depth, imbalance |
+| File | Action | Key Change |
+|------|--------|------------|
+| `src/runtime/book_snapshot.hpp` | Fill in (was empty) | `BookSnapshot` seqlock struct + reader/writer helpers |
+| `src/runtime/runtime_engine.hpp` | Modify | Add `ProcessedEvent`, `EventHandler` concept, `NoOpHandler`; templatize class; move method bodies inline; remove `print_book` |
+| `src/runtime/runtime_engine.cpp` | Modify | Keep only `TickProcessor`/`BurstDetector` impls; delete `print_book`, all `std::cout` |
+| `src/runtime/main.cpp` | Modify | Add `BookSnapshot`, launch `DisplayThread` on `std::thread` |
+| `src/runtime/display_thread.hpp` | Create | `DisplayThread` class |
+| `src/runtime/display_thread.cpp` | Create | GLFW+OpenGL3+ImGui render loop |
+| `CMakeLists.txt` | Modify | FetchContent ImGui, glfw3, OpenGL, `imgui_lib` target |
 
-## 7. Verification
+No changes to: `order_book.*`, `shm_types.hpp`, `engine_types.hpp`, `data_sim`, `accelerator_sim`.
 
-1. Build all targets
-2. Run `data_sim` + `runtime_engine` — runtime should consume ring and maintain book state
-3. Print BBO/spread/depth periodically — should match the generator's own `best_bid`/`best_ask` values in the `MarketData` snapshot (within a few events of lag)
-4. Unit test: deterministic event sequence → assert `best_bid < best_ask`, depth non-negative, cancel of unknown order is no-op
-5. Stress test: sustained burst → confirm ring doesn't overflow (head - tail < 8192)
+---
+
+## Verification
+
+1. `cmake -B build && cmake --build build` — ImGui fetched on first run; clean compile
+2. Run `data_sim` then `runtime_engine` → ImGui window opens, order book renders at ~60fps
+3. Tick rate shown in GUI should remain stable (~7k/s for eth_perpetual_futures, no decay)
+4. SIGINT in either terminal → clean shutdown, window closes, no zombie threads
+5. Optionally: add a counter to `NoOpHandler::on_event` in `main.cpp` and print on exit to confirm handler fires for every event

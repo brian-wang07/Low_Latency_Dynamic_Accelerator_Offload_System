@@ -23,10 +23,11 @@ int main() {
     auto next_time = clock::now();
 
     // Calibration counters
-    uint64_t n_add_limit  = 0;
-    uint64_t n_add_market = 0;
-    uint64_t n_cancel     = 0;
-    uint64_t n_execute    = 0;
+    uint64_t n_add_limit     = 0;
+    uint64_t n_add_limit_mkt = 0;
+    uint64_t n_add_market    = 0;
+    uint64_t n_cancel        = 0;
+    uint64_t n_execute       = 0;
     uint64_t n_total      = 0;
     double   spread_sum   = 0.0;
     double   depth_bid_sum = 0.0;
@@ -41,8 +42,9 @@ int main() {
         ++n_total;
 
         switch (ev.type) {
-            case EventType::ADD_LIMIT:  ++n_add_limit;  break;
-            case EventType::ADD_MARKET: ++n_add_market;  break;
+            case EventType::ADD_LIMIT:     ++n_add_limit;     break;
+            case EventType::ADD_LIMIT_MKT: ++n_add_limit_mkt; break;
+            case EventType::ADD_MARKET:    ++n_add_market;    break;
             case EventType::CANCEL:     ++n_cancel;      break;
             case EventType::EXECUTE:    ++n_execute;     break;
             default: break;
@@ -71,9 +73,11 @@ int main() {
 
     // Print calibration summary (§6)
     std::cout << "\n── Calibration Summary (" << N_EVENTS << " events) ──\n";
-    std::cout << "  ADD_LIMIT:  " << n_add_limit
+    std::cout << "  ADD_LIMIT:    " << n_add_limit
               << " (" << 100.0 * n_add_limit / n_total << "%)\n";
-    std::cout << "  ADD_MARKET: " << n_add_market
+    std::cout << "  ADD_LIMIT_MKT:" << n_add_limit_mkt
+              << " (" << 100.0 * n_add_limit_mkt / n_total << "%)\n";
+    std::cout << "  ADD_MARKET:   " << n_add_market
               << " (" << 100.0 * n_add_market / n_total << "%)\n";
     std::cout << "  CANCEL:     " << n_cancel
               << " (" << 100.0 * n_cancel / n_total << "%)\n";

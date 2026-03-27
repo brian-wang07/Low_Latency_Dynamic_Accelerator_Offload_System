@@ -6,7 +6,7 @@
 #include <iostream>
 #include <thread>
 
-#include <immintrin.h>
+#include "spin_pause.hpp"
 
 #include "../common/shm_manager.hpp"
 #include "../common/shm_types.hpp"
@@ -103,7 +103,7 @@ int main(int argc, char* argv[]) {
             // spin-wait until ring has space (never drop events)
             uint64_t h = ring.head.load(std::memory_order_relaxed);
             while (h - ring.tail.load(std::memory_order_acquire) >= engine::shm::EVENT_RING_CAPACITY) {
-                _mm_pause();
+                SPIN_PAUSE();
                 if (!g_running) goto done;
             }
 

@@ -138,6 +138,17 @@ int64_t DataGenerator::sample_limit_price(Side side) {
     }
 }
 
+// Marketable limit price: at or through the opposing best price, uniform over [0, N] ticks
+// BID: [best_ask, best_ask + N*tick],  ASK: [best_bid - N*tick, best_bid]
+int64_t DataGenerator::sample_marketable_limit_price(Side side) {
+    int64_t tick_fp = to_fixed(cfg_.tick_size);
+    int     offset  = std::uniform_int_distribution<int>(0, cfg_.mkt_limit_max_ticks)(rng_);
+    if (side == Side::BID)
+        return compute_best_ask() + static_cast<int64_t>(offset) * tick_fp;
+    else
+        return compute_best_bid() - static_cast<int64_t>(offset) * tick_fp;
+}
+
 int64_t DataGenerator::sample_qty() {
     double  raw = std::exp(cfg_.qty_log_mean + cfg_.qty_log_sigma * normal_(rng_));
     int64_t qty = std::max(int64_t(1), static_cast<int64_t>(std::round(raw)));
@@ -224,6 +235,68 @@ void DataGenerator::match_market_order(Side aggressor_side, int64_t qty, uint64_
     int64_t filled = (aggressor_side == Side::BID) ? walk_levels(ask_levels_)
                                                     : walk_levels(bid_levels_);
     if (filled > 0) apply_price_impact(aggressor_side, filled);
+}
+
+// Walk opposite side up to limit_price, emit EXECUTE events, apply price impact.
+// Returns qty_remaining (unfilled residual that should rest as a passive limit).
+int64_t DataGenerator::match_limit_order(
+    Side aggressor_side, int64_t limit_price, int64_t qty, uint64_t ts_ns)
+{
+    Side passive_side = (aggressor_side == Side::BID) ? Side::ASK : Side::BID;
+
+    auto walk_levels = [&](auto& levels) -> int64_t {
+        int64_t remaining    = qty;
+        int64_t total_filled = 0;
+
+        while (remaining > 0 && !levels.empty()) {
+            auto    it          = levels.begin();
+            int64_t level_price = it->first;
+
+            // Stop when remaining levels are no longer crossable by the limit price
+            if (aggressor_side == Side::BID && level_price > limit_price) break;
+            if (aggressor_side == Side::ASK && level_price < limit_price) break;
+
+            int64_t level_qty = it->second;
+            int64_t fill      = std::min(remaining, level_qty);
+
+            remaining    -= fill;
+            total_filled += fill;
+
+            OrderEvent exec{};
+            exec.timestamp_ns  = ts_ns;
+            exec.order_id      = 0;
+            exec.type          = EventType::EXECUTE;
+            exec.side          = passive_side;
+            exec.price         = level_price;
+            exec.qty           = fill;
+            exec.qty_remaining = level_qty - fill;
+            pending_events_.push_back(make_event(exec, 0));
+
+            int64_t to_fill = fill;
+            std::vector<uint64_t> to_remove;
+            for (auto& [oid, lo] : live_orders_) {
+                if (lo.side != passive_side || lo.price != level_price) continue;
+                if (to_fill >= lo.qty) {
+                    to_fill -= lo.qty;
+                    to_remove.push_back(oid);
+                } else {
+                    lo.qty -= to_fill;
+                    to_fill = 0;
+                }
+                if (to_fill <= 0) break;
+            }
+            for (uint64_t oid : to_remove) live_orders_.erase(oid);
+
+            it->second -= fill;
+            if (it->second <= 0) levels.erase(it);
+        }
+        return total_filled;
+    };
+
+    int64_t filled = (aggressor_side == Side::BID) ? walk_levels(ask_levels_)
+                                                    : walk_levels(bid_levels_);
+    if (filled > 0) apply_price_impact(aggressor_side, filled);
+    return qty - filled;
 }
 
 // Δμ = sign × impact_coeff × fill_qty / depth_at_bbo
@@ -316,9 +389,15 @@ GeneratedEvent DataGenerator::next() {
     EventType etype;
     bool      is_modify = false;
 
-    if      (u < cfg_.p_add_limit)                              etype = EventType::ADD_LIMIT;
-    else if (u < cfg_.p_add_limit + cfg_.p_cancel)              etype = EventType::CANCEL;
-    else if (u < cfg_.p_add_limit + cfg_.p_cancel + cfg_.p_add_market) etype = EventType::ADD_MARKET;
+    double cum_limit     = cfg_.p_add_limit;
+    double cum_cancel    = cum_limit  + cfg_.p_cancel;
+    double cum_market    = cum_cancel + cfg_.p_add_market;
+    double cum_mkt_limit = cum_market + cfg_.p_add_limit_mkt;
+
+    if      (u < cum_limit)     etype = EventType::ADD_LIMIT;
+    else if (u < cum_cancel)    etype = EventType::CANCEL;
+    else if (u < cum_market)    etype = EventType::ADD_MARKET;
+    else if (u < cum_mkt_limit) etype = EventType::ADD_LIMIT_MKT;
     else { etype = EventType::CANCEL; is_modify = true; }
 
     // No live orders to cancel — fall back to ADD_LIMIT
@@ -367,6 +446,35 @@ GeneratedEvent DataGenerator::next() {
         ev.qty           = sample_qty();
         ev.qty_remaining = ev.qty;
         match_market_order(event_side, ev.qty, ev.timestamp_ns);
+        break;
+    }
+    case EventType::ADD_LIMIT_MKT: {
+        ev.order_id      = next_order_id_++;
+        ev.type          = EventType::ADD_LIMIT_MKT;
+        ev.side          = event_side;
+        ev.price         = sample_marketable_limit_price(event_side);
+        ev.qty           = sample_qty();
+        ev.qty_remaining = ev.qty;
+
+        int64_t residual = match_limit_order(event_side, ev.price, ev.qty, ev.timestamp_ns);
+
+        if (residual > 0) {
+            OrderEvent add_ev{};
+            add_ev.timestamp_ns  = ev.timestamp_ns;
+            add_ev.order_id      = next_order_id_++;
+            add_ev.type          = EventType::ADD_LIMIT;
+            add_ev.side          = event_side;
+            add_ev.price         = ev.price;
+            add_ev.qty           = residual;
+            add_ev.qty_remaining = residual;
+
+            double lifetime = std::exponential_distribution<double>(cfg_.cancel_rate_gamma)(rng_);
+            LiveOrder lo{add_ev.order_id, add_ev.side, add_ev.price, add_ev.qty,
+                         current_time_ + lifetime};
+            add_live_order(lo);
+            expiry_queue_.push({lo.expiry_time, lo.order_id});
+            pending_events_.push_back(make_event(add_ev, 0));
+        }
         break;
     }
     default: break;

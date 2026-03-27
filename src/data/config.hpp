@@ -62,10 +62,14 @@ struct DataGeneratorConfig {
     double   hawkes_beta     = 8.0;
 
     // Event type probabilities
-    double   p_add_limit     = 0.72;
+    double   p_add_limit     = 0.70;
     double   p_cancel        = 0.21;
     double   p_add_market    = 0.06;
     double   p_modify        = 0.01;
+    double   p_add_limit_mkt = 0.02;  // marketable limit orders
+
+    // Marketable limit price placement
+    int      mkt_limit_max_ticks = 3; // max ticks through best opposing price
 
     double   cancel_rate_gamma = 25000.0;  // exponential lifetime parameter
 
@@ -142,6 +146,8 @@ inline DataGeneratorConfig load_config(const std::string& path) {
     opt("p_cancel",                cfg.p_cancel);
     opt("p_add_market",            cfg.p_add_market);
     opt("p_modify",                cfg.p_modify);
+    opt("p_add_limit_mkt",         cfg.p_add_limit_mkt);
+    opt("mkt_limit_max_ticks",     cfg.mkt_limit_max_ticks);
     opt("cancel_rate_gamma",       cfg.cancel_rate_gamma);
     opt("geom_p",                  cfg.geom_p);
     opt("max_offset_ticks",        cfg.max_offset_ticks);
