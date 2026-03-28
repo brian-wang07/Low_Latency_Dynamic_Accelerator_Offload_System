@@ -10,7 +10,7 @@
 #include <deque>
 #include <map>
 #include <unordered_map>
-#include <queue>
+#include <set>
 
 #include "config.hpp"
 
@@ -20,13 +20,17 @@ struct LiveOrder {
     int64_t     price;
     int64_t     qty;
     double      expiry_time;
-    std::size_t ids_idx;      // index into live_order_ids_ for O(1) removal
+    std::size_t ids_idx;          // index into live_order_ids_ for O(1) removal
+    std::size_t price_idx_pos;    // index into {bid,ask}_order_idx_[price] for O(1) removal
 };
 
 struct ExpiryEntry {
     double   expiry_time;
     uint64_t order_id;
-    bool operator>(const ExpiryEntry& o) const { return expiry_time > o.expiry_time; }
+    bool operator<(const ExpiryEntry& o) const {
+        if (expiry_time != o.expiry_time) return expiry_time < o.expiry_time;
+        return order_id < o.order_id;
+    }
 };
 
 class DataGenerator {
@@ -62,8 +66,7 @@ private:
     // price -> [order_ids] index for O(1) lookup during matching
     std::unordered_map<int64_t, std::vector<uint64_t>> bid_order_idx_;
     std::unordered_map<int64_t, std::vector<uint64_t>> ask_order_idx_;
-    std::priority_queue<ExpiryEntry, std::vector<ExpiryEntry>,
-                        std::greater<ExpiryEntry>>      expiry_queue_;
+    std::set<ExpiryEntry>                                  expiry_set_;
 
     std::deque<GeneratedEvent> pending_events_;
 

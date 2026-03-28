@@ -155,15 +155,19 @@ int64_t DataGenerator::sample_qty() {
 void DataGenerator::add_live_order(const LiveOrder& order) {
     LiveOrder lo = order;
     lo.ids_idx = live_order_ids_.size();
-    live_orders_[lo.order_id] = lo;
     live_order_ids_.push_back(lo.order_id);
     if (lo.side == Side::BID) {
         bid_levels_[lo.price] += lo.qty;
-        bid_order_idx_[lo.price].push_back(lo.order_id);
+        auto& ids = bid_order_idx_[lo.price];
+        lo.price_idx_pos = ids.size();
+        ids.push_back(lo.order_id);
     } else {
         ask_levels_[lo.price] += lo.qty;
-        ask_order_idx_[lo.price].push_back(lo.order_id);
+        auto& ids = ask_order_idx_[lo.price];
+        lo.price_idx_pos = ids.size();
+        ids.push_back(lo.order_id);
     }
+    live_orders_[lo.order_id] = lo;
 }
 
 void DataGenerator::remove_live_order(uint64_t order_id) {
@@ -188,11 +192,15 @@ void DataGenerator::remove_live_order(uint64_t order_id) {
         auto idx_it = idx_map.find(o.price);
         if (idx_it != idx_map.end()) {
             auto& ids = idx_it->second;
-            for (std::size_t i = 0; i < ids.size(); ++i) {
-                if (ids[i] == order_id) {
-                    ids[i] = ids.back();
-                    ids.pop_back();
-                    break;
+            std::size_t pos = o.price_idx_pos;
+            if (pos < ids.size()) {
+                uint64_t back_id = ids.back();
+                ids[pos] = back_id;
+                ids.pop_back();
+                if (back_id != order_id) {
+                    auto back_it = live_orders_.find(back_id);
+                    if (back_it != live_orders_.end())
+                        back_it->second.price_idx_pos = pos;
                 }
             }
             if (ids.empty()) idx_map.erase(idx_it);
@@ -214,6 +222,7 @@ void DataGenerator::remove_live_order(uint64_t order_id) {
         }
         erase_from_idx(ask_order_idx_);
     }
+    expiry_set_.erase({o.expiry_time, o.order_id});
     live_orders_.erase(it);
 }
 
@@ -225,6 +234,7 @@ void DataGenerator::match_market_order(Side aggressor_side, int64_t qty, uint64_
     auto erase_live = [&](uint64_t oid) {
         auto oit = live_orders_.find(oid);
         if (oit == live_orders_.end()) return;
+        expiry_set_.erase({oit->second.expiry_time, oid});
         std::size_t idx = oit->second.ids_idx;
         if (idx < live_order_ids_.size()) {
             uint64_t back_id = live_order_ids_.back();
@@ -270,12 +280,25 @@ void DataGenerator::match_market_order(Side aggressor_side, int64_t qty, uint64_
                 while (i < ids.size() && to_fill > 0) {
                     auto oit = live_orders_.find(ids[i]);
                     if (oit == live_orders_.end()) {
-                        ids[i] = ids.back(); ids.pop_back(); continue;
+                        uint64_t back_id = ids.back();
+                        ids[i] = back_id;
+                        ids.pop_back();
+                        if (i < ids.size()) {
+                            auto bit = live_orders_.find(back_id);
+                            if (bit != live_orders_.end()) bit->second.price_idx_pos = i;
+                        }
+                        continue;
                     }
                     if (to_fill >= oit->second.qty) {
                         to_fill -= oit->second.qty;
                         erase_live(ids[i]);
-                        ids[i] = ids.back(); ids.pop_back();
+                        uint64_t back_id = ids.back();
+                        ids[i] = back_id;
+                        ids.pop_back();
+                        if (i < ids.size()) {
+                            auto bit = live_orders_.find(back_id);
+                            if (bit != live_orders_.end()) bit->second.price_idx_pos = i;
+                        }
                     } else {
                         oit->second.qty -= to_fill;
                         to_fill = 0;
@@ -307,6 +330,7 @@ int64_t DataGenerator::match_limit_order(
     auto erase_live = [&](uint64_t oid) {
         auto oit = live_orders_.find(oid);
         if (oit == live_orders_.end()) return;
+        expiry_set_.erase({oit->second.expiry_time, oid});
         std::size_t idx = oit->second.ids_idx;
         if (idx < live_order_ids_.size()) {
             uint64_t back_id = live_order_ids_.back();
@@ -356,12 +380,25 @@ int64_t DataGenerator::match_limit_order(
                 while (i < ids.size() && to_fill > 0) {
                     auto oit = live_orders_.find(ids[i]);
                     if (oit == live_orders_.end()) {
-                        ids[i] = ids.back(); ids.pop_back(); continue;
+                        uint64_t back_id = ids.back();
+                        ids[i] = back_id;
+                        ids.pop_back();
+                        if (i < ids.size()) {
+                            auto bit = live_orders_.find(back_id);
+                            if (bit != live_orders_.end()) bit->second.price_idx_pos = i;
+                        }
+                        continue;
                     }
                     if (to_fill >= oit->second.qty) {
                         to_fill -= oit->second.qty;
                         erase_live(ids[i]);
-                        ids[i] = ids.back(); ids.pop_back();
+                        uint64_t back_id = ids.back();
+                        ids[i] = back_id;
+                        ids.pop_back();
+                        if (i < ids.size()) {
+                            auto bit = live_orders_.find(back_id);
+                            if (bit != live_orders_.end()) bit->second.price_idx_pos = i;
+                        }
                     } else {
                         oit->second.qty -= to_fill;
                         to_fill = 0;
@@ -420,24 +457,22 @@ GeneratedEvent DataGenerator::next() {
     }
 
     // (b) Check if earliest lifetime-expiry fires before next Hawkes event
-    while (!expiry_queue_.empty()) {
-        const auto& top = expiry_queue_.top();
-        if (live_orders_.find(top.order_id) == live_orders_.end()) {
-            expiry_queue_.pop();  // already cancelled / filled
-            continue;
-        }
-        if (top.expiry_time >= pending_hawkes_time_) break;
+    while (!expiry_set_.empty()) {
+        auto sit = expiry_set_.begin();
+        if (sit->expiry_time >= pending_hawkes_time_) break;
 
-        uint64_t oid      = top.order_id;
-        double   expiry_t = top.expiry_time;
-        expiry_queue_.pop();
+        uint64_t oid      = sit->order_id;
+        double   expiry_t = sit->expiry_time;
 
         double dt = expiry_t - current_time_;
         step_processes(dt);
         current_time_ = expiry_t;
 
         auto it = live_orders_.find(oid);
-        if (it == live_orders_.end()) continue;
+        if (it == live_orders_.end()) {
+            expiry_set_.erase(sit);
+            continue;
+        }
 
         OrderEvent ev{};
         ev.timestamp_ns  = time_to_ns(current_time_);
@@ -448,7 +483,7 @@ GeneratedEvent DataGenerator::next() {
         ev.qty           = it->second.qty;
         ev.qty_remaining = 0;
 
-        remove_live_order(oid);
+        remove_live_order(oid);  // also erases from expiry_set_
         return make_event(ev, apply_jitter(static_cast<uint64_t>(dt * 1e12)));
     }
 
@@ -506,7 +541,7 @@ GeneratedEvent DataGenerator::next() {
         double lifetime = std::exponential_distribution<double>(cfg_.cancel_rate_gamma)(rng_);
         LiveOrder lo{ev.order_id, ev.side, ev.price, ev.qty, current_time_ + lifetime};
         add_live_order(lo);
-        expiry_queue_.push({lo.expiry_time, lo.order_id});
+        expiry_set_.insert({lo.expiry_time, lo.order_id});
         break;
     }
     case EventType::CANCEL: {
@@ -574,7 +609,7 @@ GeneratedEvent DataGenerator::next() {
             LiveOrder lo{add_ev.order_id, add_ev.side, add_ev.price, add_ev.qty,
                          current_time_ + lifetime};
             add_live_order(lo);
-            expiry_queue_.push({lo.expiry_time, lo.order_id});
+            expiry_set_.insert({lo.expiry_time, lo.order_id});
             pending_events_.push_back(make_event(add_ev, 0));
         }
         break;
@@ -599,7 +634,7 @@ GeneratedEvent DataGenerator::next() {
         LiveOrder lo{add_ev.order_id, add_ev.side, add_ev.price, add_ev.qty,
                      current_time_ + lifetime};
         add_live_order(lo);
-        expiry_queue_.push({lo.expiry_time, lo.order_id});
+        expiry_set_.insert({lo.expiry_time, lo.order_id});
         pending_events_.push_back(make_event(add_ev, 0));
     }
 

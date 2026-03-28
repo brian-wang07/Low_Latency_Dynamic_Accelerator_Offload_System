@@ -111,6 +111,7 @@ int main(int argc, char* argv[]) {
 
             auto& slot         = ring.slots[h & engine::shm::EVENT_RING_MASK];
             slot.sequence      = h + 1;
+            slot.enqueue_tsc   = __rdtsc();
             slot.timestamp_ns  = ev.timestamp_ns;
             slot.order_id      = ev.order_id;
             slot.price         = ev.price;
@@ -139,9 +140,16 @@ int main(int argc, char* argv[]) {
 
             if (ge.wait_ps > 0) {
                 next_time += std::chrono::nanoseconds(ge.wait_ps / 1000);
+                // Clamp: don't accumulate unbounded time debt when processing
+                // overhead exceeds the configured interval. Each event waits at
+                // most its configured interval from "now", enforcing the correct
+                // rate for all configs regardless of system throughput.
+                auto now = clock::now();
+                if (next_time < now)
+                    next_time = now;
 
                 while (g_running) {
-                    auto now = clock::now();
+                    now = clock::now();
                     if (now >= next_time) break;
                     auto remaining = next_time - now;
                     if (remaining > std::chrono::microseconds(50))

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <concepts>
 #include <array>
 #include <csignal>
@@ -15,6 +16,34 @@
 #include "order_book.hpp"
 #include "book_snapshot.hpp"
 #include "engine_types.hpp"
+
+struct LatencyTracker {
+    // Collect raw samples per 64-event snapshot window.
+    // Sorting 64 elements in publish_snapshot is trivial; no heap allocation needed.
+    static constexpr uint32_t MAX_SAMPLES = 64;
+    uint64_t samples[MAX_SAMPLES]{};
+    uint32_t count = 0;
+
+    // O(1) — hot event path
+    void record(uint64_t latency_ns) noexcept {
+        if (count < MAX_SAMPLES)
+            samples[count++] = latency_ns;
+    }
+
+    // O(1) — just reset the count
+    void reset() noexcept { count = 0; }
+
+    // O(N log N) on 64 elements — negligible; called from publish_snapshot only
+    std::pair<double,double> p50_p99_us() const noexcept {
+        if (count == 0) return {0.0, 0.0};
+        uint64_t sorted[MAX_SAMPLES];
+        std::copy(samples, samples + count, sorted);
+        std::sort(sorted, sorted + count);
+        double p50 = sorted[count / 2] / 1000.0;
+        double p99 = sorted[count * 99u / 100u] / 1000.0;
+        return {p50, p99};
+    }
+};
 
 struct BurstStats {
     uint64_t mean_inter_arrival_ns;
@@ -53,6 +82,9 @@ public:
     void on_tick(uint64_t received_at_ns);
     bool in_burst() const noexcept;
     BurstStats stats() const noexcept;
+    double threshold_tps() const noexcept {
+        return burst_threshold_ns_ > 0 ? 1e9 / double(burst_threshold_ns_) : 0.0;
+    }
 
 private:
     std::array<uint64_t, WindowSize> timestamps_{};
@@ -99,11 +131,26 @@ public:
     void run(volatile sig_atomic_t& running, BookSnapshot& snapshot);
 
 private:
+    static double calibrate_tsc_ns_per_cycle() noexcept {
+        using clock = std::chrono::steady_clock;
+        (void)__rdtsc();  // warm up
+        auto wall_start   = clock::now();
+        uint64_t tsc_start = __rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        uint64_t tsc_end  = __rdtsc();
+        auto wall_end     = clock::now();
+        double elapsed_ns  = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 wall_end - wall_start).count();
+        return elapsed_ns / (double)(tsc_end - tsc_start);
+    }
+
     ShmManager shm_;
     TickProcessor processor_;
     Handler handler_;
     BurstDetector<> detector_;
     OrderBook book_;
+    LatencyTracker lat_tracker_;
+    double tsc_to_ns_ = 1.0;
 
     // ring consumer state
     uint64_t last_ring_tail_ = 0;
@@ -123,20 +170,29 @@ private:
 
 template<EventHandler H>
 void RuntimeEngine<H>::publish_snapshot(BookSnapshot& snap, uint64_t seq) {
+    auto [p50, p99] = lat_tracker_.p50_p99_us();
+    lat_tracker_.reset();
+
     snapshot_begin_write(snap);
-    snap.best_bid        = book_.best_bid();
-    snap.best_ask        = book_.best_ask();
-    snap.spread          = book_.spread();
-    snap.total_bid_qty   = book_.total_bid_qty();
-    snap.total_ask_qty   = book_.total_ask_qty();
-    snap.imbalance       = book_.bid_ask_imbalance(3);
-    snap.vwmid           = book_.volume_weighted_mid(3) / PRICE_SCALE;
-    snap.ema             = processor_.ema();
-    snap.tick_rate       = processor_.tick_rate();
-    snap.in_burst        = detector_.in_burst();
-    snap.bid_level_count = (uint32_t)book_.bid_depth(snap.bids, SNAPSHOT_DEPTH);
-    snap.ask_level_count = (uint32_t)book_.ask_depth(snap.asks, SNAPSHOT_DEPTH);
-    snap.event_sequence  = seq;
+    snap.best_bid             = book_.best_bid();
+    snap.best_ask             = book_.best_ask();
+    snap.spread               = book_.spread();
+    snap.total_bid_qty        = book_.total_bid_qty();
+    snap.total_ask_qty        = book_.total_ask_qty();
+    snap.imbalance            = book_.bid_ask_imbalance(3);
+    snap.vwmid                = book_.volume_weighted_mid(3) / PRICE_SCALE;
+    snap.ema                  = processor_.ema();
+    snap.tick_rate            = processor_.tick_rate();
+    snap.in_burst             = detector_.in_burst();
+    snap.bid_level_count      = (uint32_t)book_.bid_depth(snap.bids, SNAPSHOT_DEPTH);
+    snap.ask_level_count      = (uint32_t)book_.ask_depth(snap.asks, SNAPSHOT_DEPTH);
+    snap.event_sequence       = seq;
+    snap.latency_p50_us       = p50;
+    snap.latency_p99_us       = p99;
+    snap.ring_occupancy       = double(shm_.as<engine::shm::SharedMemoryBlock>()->event_ring.head.load(std::memory_order_relaxed)
+                                     - shm_.as<engine::shm::SharedMemoryBlock>()->event_ring.tail.load(std::memory_order_relaxed))
+                                / double(engine::shm::EVENT_RING_CAPACITY);
+    snap.burst_threshold_tps  = detector_.threshold_tps();
     snapshot_end_write(snap);
 }
 
@@ -157,6 +213,10 @@ void RuntimeEngine<H>::flush_batch(engine::shm::SharedMemoryBlock* block, uint64
 
 template <EventHandler H>
 void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapshot) {
+    std::cout << "Calibrating TSC...\n";
+    tsc_to_ns_ = calibrate_tsc_ns_per_cycle();
+    std::cout << "TSC: " << tsc_to_ns_ << " ns/cycle\n";
+
     std::cout << "Waiting for shared memory...\n";
     while (!shm_.open()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -200,12 +260,13 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
             int64_t bid = book_.best_bid();
             int64_t ask = book_.best_ask();
             int64_t mid = (bid && ask) ? (bid + ask) / 2 : (bid | ask);
-            uint64_t received_at = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            uint64_t received_tsc = __rdtsc();
+            uint64_t received_at  = (uint64_t)(received_tsc * tsc_to_ns_);
 
             detector_.on_tick(slot.timestamp_ns);
             processor_.on_tick(mid, received_at);
+            if (slot.enqueue_tsc > 0)
+                lat_tracker_.record((uint64_t)((received_tsc - slot.enqueue_tsc) * tsc_to_ns_));
 
             // burst / accelerator routing
             bool burst_now = detector_.in_burst();

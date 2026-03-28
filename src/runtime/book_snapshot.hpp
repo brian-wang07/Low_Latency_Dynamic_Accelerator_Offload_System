@@ -6,7 +6,7 @@
 #include <cstring>
 #include "order_book.hpp"   // PriceLevel
 
-constexpr inline std::size_t SNAPSHOT_DEPTH = 8;
+constexpr inline std::size_t SNAPSHOT_DEPTH = 16;
 
 struct alignas(64) BookSnapshot {
     //seqlock with runtime engine; spin on odd version
@@ -31,6 +31,11 @@ struct alignas(64) BookSnapshot {
     uint32_t ask_level_count{0};
 
     uint64_t event_sequence{0};
+
+    double latency_p50_us{0.0};       // rolling P50 E2E latency (µs)
+    double latency_p99_us{0.0};       // rolling P99 E2E latency (µs)
+    double ring_occupancy{0.0};       // SPSC ring fill ratio [0.0, 1.0]
+    double burst_threshold_tps{0.0};  // tick rate above which bursts offload to accelerator
 };
 
 

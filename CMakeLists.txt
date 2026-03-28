@@ -10,7 +10,11 @@ if(APPLE AND NOT DEFINED CMAKE_CXX_COMPILER)
     endif()
 endif()
 
-project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX OBJCXX)
+if(APPLE)
+    project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX OBJCXX)
+else()
+    project(LowLatencyEngine VERSION 0.1.0 LANGUAGES CXX)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -24,7 +28,22 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(imgui)
 
-find_package(glfw3 3.4 REQUIRED)
+FetchContent_Declare(
+    implot
+    GIT_REPOSITORY https://github.com/epezent/implot.git
+    GIT_TAG        v0.16
+)
+FetchContent_MakeAvailable(implot)
+
+FetchContent_Declare(
+    jetbrains_mono
+    GIT_REPOSITORY https://github.com/JetBrains/JetBrainsMono.git
+    GIT_TAG        v2.304
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(jetbrains_mono)
+
+find_package(glfw3 3.3 REQUIRED)
 find_package(OpenGL REQUIRED)
 
 add_library(imgui_lib STATIC
@@ -40,6 +59,13 @@ target_include_directories(imgui_lib PUBLIC
     ${imgui_SOURCE_DIR}/backends
 )
 target_link_libraries(imgui_lib PUBLIC glfw OpenGL::GL)
+
+add_library(implot_lib STATIC
+    ${implot_SOURCE_DIR}/implot.cpp
+    ${implot_SOURCE_DIR}/implot_items.cpp
+)
+target_include_directories(implot_lib PUBLIC ${implot_SOURCE_DIR})
+target_link_libraries(implot_lib PUBLIC imgui_lib)
 
 # On macOS, GLFW headers pull in Cocoa which uses Objective-C blocks (^).
 # Compile the GLFW and OpenGL backends as Objective-C++ to handle this.
@@ -94,7 +120,10 @@ add_executable(runtime_engine
     src/runtime/display_thread.cpp
 )
 target_include_directories(runtime_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
-target_link_libraries(runtime_engine PRIVATE common Threads::Threads ${RT_LIB} imgui_lib)
+target_link_libraries(runtime_engine PRIVATE common Threads::Threads ${RT_LIB} imgui_lib implot_lib)
+target_compile_definitions(runtime_engine PRIVATE
+    JETBRAINS_MONO_FONT="${jetbrains_mono_SOURCE_DIR}/fonts/ttf/JetBrainsMono-Regular.ttf"
+)
 
 # Process 3: Accelerator Simulator
 add_executable(accelerator_sim src/accelerator/main.cpp)
