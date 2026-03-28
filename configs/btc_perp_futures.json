@@ -1,7 +1,7 @@
 {
   "base_interval_ns": 50,
   "burst_interval_ns": 5,
-  "daily_volatility": 0.08,
+  "daily_volatility": 0.02,
   "mean_reversion_speed": 0.01,
   "burst_probability": 0.10,
   "burst_volatility_multiplier": 6.0,

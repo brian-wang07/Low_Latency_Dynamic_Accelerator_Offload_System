@@ -21,6 +21,7 @@ static constexpr float HIST_S              = 30.f;   // plot history window (sec
 static constexpr float IMBAL_EMA_ALPHA     = 0.05f;  // imbalance EMA smoothing factor
 static constexpr float BOOK_UPDATE_HZ      = 2.f;    // order book refresh rate (configurable)
 static constexpr float BOOK_UPDATE_INTERVAL = 1.f / BOOK_UPDATE_HZ;
+static constexpr float SLA_TARGET          = 5.0f;   // maximum acceptable latency
 
 // ---------------------------------------------------------------------------
 // Large font for the spread display (set in DisplayThread::run)
@@ -43,7 +44,7 @@ static int format_metric_suffix(double value, char* buf, int size, void*) {
 // Scrolling ring buffer — one entry per display frame (~60 fps)
 // ---------------------------------------------------------------------------
 struct PlotRing {
-    static constexpr int N = 1200;  // ~20 s at 60 fps
+    static constexpr int N = 5000;  // ~20 s at 60 fps
     float t[N]{};
     float bid[N]{}, ask[N]{}, vwmid[N]{};
     float micro_trend[N]{};    // to_display(ema) - vwmid
@@ -125,26 +126,50 @@ static void plot_price_trio(const BookSnapshot& s, const PlotRing& ring,
     ImGui::TextUnformatted(vbuf);
     ImGui::PopStyleColor();
 
-    auto [blo, bhi] = ring_range(ring.bid,   sz, oldest, 0.f);
-    auto [alo, ahi] = ring_range(ring.ask,   sz, oldest, 0.f);
-    auto [vlo, vhi] = ring_range(ring.vwmid, sz, oldest, 0.f);
-    float y_lo = std::min({blo, alo, vlo});
-    float y_hi = std::max({bhi, ahi, vhi});
-    float pad  = (y_hi - y_lo) * 0.1f;
-    if (pad < 1e-6f) pad = 1.f;
-    y_lo -= pad; y_hi += pad;
+    // 2. STATE FOR HYSTERESIS
+    static float sticky_lo = 0, sticky_hi = 0;
+    static float last_zoom_time = 0;
+
+    // Get the actual min/max of the data in your history buffer
+    auto [data_lo, data_hi] = ring_range(ring.vwmid, sz, oldest, 0.001f);
+    float data_span = data_hi - data_lo;
+    float current_view_span = sticky_hi - sticky_lo;
+
+    // --- LOGIC STEP 1: EXPANSION (INSTANT) ---
+    // If price escapes the "inner 80%" of our view, we expand immediately
+    bool out_of_bounds = (s.vwmid < sticky_lo + (current_view_span * 0.1f)) || 
+                         (s.vwmid > sticky_hi - (current_view_span * 0.1f));
+
+    // --- LOGIC STEP 2: CONTRACTION (DELAYED) ---
+    // If the data span is less than 50% of our current view for > 2 seconds, we zoom in
+    bool should_contract = (data_span < current_view_span * 0.5f) && (t_now - last_zoom_time > 2.0f);
+
+    if (sticky_lo == 0 || out_of_bounds || should_contract) {
+        // Center the new view on the current mid
+        // Add 25% padding so we don't have to resize again immediately
+        float padding = std::max(data_span * 0.25f, 0.005f); 
+        sticky_lo = data_lo - padding;
+        sticky_hi = data_hi + padding;
+        last_zoom_time = t_now;
+    }
 
     if (ImPlot::BeginPlot("##trio", psz, ImPlotFlags_NoMenus)) {
         ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_None);
         ImPlot::SetupAxisLimits(ImAxis_X1, t_now - HIST_S, t_now, ImGuiCond_Always);
-        ImPlot::SetupAxisLimits(ImAxis_Y1, y_lo, y_hi, ImGuiCond_Always);
+        
+        // The Y-axis only changes when the 'if' block above triggers
+        ImPlot::SetupAxisLimits(ImAxis_Y1, sticky_lo, sticky_hi, ImGuiCond_Always);
+
         if (sz > 1) {
-            ImPlot::SetNextLineStyle(ImVec4(0.2f, 0.9f, 0.2f, 1.f), 1.5f);
-            ImPlot::PlotLine("Best Bid", ring.t, ring.bid, sz, ImPlotLineFlags_None, oldest);
-            ImPlot::SetNextLineStyle(ImVec4(0.9f, 0.2f, 0.2f, 1.f), 1.5f);
-            ImPlot::PlotLine("Best Ask", ring.t, ring.ask, sz, ImPlotLineFlags_None, oldest);
-            ImPlot::SetNextLineStyle(ImVec4(0.3f, 0.8f, 1.0f, 1.f), 1.5f);
-            ImPlot::PlotLine("VWMID",    ring.t, ring.vwmid, sz, ImPlotLineFlags_None, oldest);
+            // Bid/Ask Lines (lower alpha)
+            ImPlot::SetNextLineStyle(ImVec4(0.2f, 0.9f, 0.2f, 0.4f), 1.0f);
+            ImPlot::PlotLine("Bid", ring.t, ring.bid, sz, 0, oldest);
+            ImPlot::SetNextLineStyle(ImVec4(0.9f, 0.2f, 0.2f, 0.4f), 1.0f);
+            ImPlot::PlotLine("Ask", ring.t, ring.ask, sz, 0, oldest);
+            
+            // Mid Line (solid/bold)
+            ImPlot::SetNextLineStyle(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), 2.0f);
+            ImPlot::PlotLine("Mid", ring.t, ring.vwmid, sz, 0, oldest);
         }
         ImPlot::EndPlot();
     }
@@ -264,16 +289,22 @@ static void plot_latency(const BookSnapshot& s, const PlotRing& ring,
                   s.latency_p50_us, s.latency_p99_us);
     ImGui::TextUnformatted(lbuf);
 
-    auto [lo50, hi50] = ring_range(ring.lat_p50, sz, oldest, 1.f);
-    auto [lo99, hi99] = ring_range(ring.lat_p99, sz, oldest, 1.f);
-    float y_lo = 0.f;
-    float y_hi = std::max(hi50, hi99) * 1.2f;
-    if (y_hi < 1.f) y_hi = 1.f;
+    auto [_, hi99] = ring_range(ring.lat_p99, sz, oldest, 1.f);
+
+    float y_limit = 30.0f;
 
     if (ImPlot::BeginPlot("##lat", psz, ImPlotFlags_NoMenus)) {
         ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_NoTickLabels, ImPlotAxisFlags_None);
         ImPlot::SetupAxisLimits(ImAxis_X1, t_now - HIST_S, t_now, ImGuiCond_Always);
-        ImPlot::SetupAxisLimits(ImAxis_Y1, y_lo, y_hi, ImGuiCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, 0.f, y_limit, ImGuiCond_Always);
+
+        float tx[2] = {t_now - HIST_S, t_now};
+        float ty[2] = {SLA_TARGET, SLA_TARGET};
+
+        ImPlot::SetNextLineStyle(ImVec4(1.0f, 1.0f, 1.0f, 0.2f), 1.0f);
+        ImPlot::PlotLine("Latency Target", tx, ty, 2);
+
+
         if (sz > 1) {
             ImPlot::SetNextLineStyle(ImVec4(0.3f, 0.8f, 1.0f, 1.f), 1.5f);
             ImPlot::PlotLine("P50", ring.t, ring.lat_p50, sz, ImPlotLineFlags_None, oldest);
