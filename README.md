@@ -8,15 +8,17 @@ A userspace market-making engine with synthetic order flow, microburst detection
 
 ```
   ┌─────────────────────────────────────────────────────────────────────────┐
-  │  data_sim  (process)                                                    │
+  │  data_sim  (process 1)                                                  │
   │                                                                         │
   │  DataGenerator                                                          │
-  │  ├── OU mid-price + CIR spread (stochastic processes)                   │
-  │  ├── Hawkes process (self-exciting event arrivals)                      │
+  │  ├── RegimeMachine (CALM → ACTIVE → BURST state machine)                │
+  │  ├── OU mid-price (GBM for crypto, logit-space for prediction markets)  │
+  │  ├── OU spread (plain OU, hard floor at 1 tick)                         │
   │  ├── Truncated geometric limit order placement                          │
   │  ├── Marketable limit orders (ADD_LIMIT_MKT)                            │
   │  ├── Market orders w/ price impact                                      │
-  │  └── Burst mode (volatility + rate multiplier)                          │
+  │  ├── SidePool order tracking (fixed-size, zero heap alloc)              │
+  │  └── Crossed/stale order sweep on BBO move                              │
   │                          │                                              │
   │                          │  EventRingBuffer (SPSC, 8192 slots)          │
   │                          │  ShmOrderEvent: ADD_LIMIT / ADD_LIMIT_MKT /  │
@@ -24,41 +26,39 @@ A userspace market-making engine with synthetic order flow, microburst detection
   └──────────────────────────┼──────────────────────────────────────────────┘
                              │ POSIX shared memory  (/engine_shm_mvp)
   ┌──────────────────────────▼──────────────────────────────────────────────┐
-  │  runtime_engine  (process)                                              │
+  │  runtime_engine  (process 2, two pinned threads)                        │
   │                                                                         │
-  │  engine thread  ──── spin-polls ring buffer (_mm_pause)                 │
+  │  orchestrator thread  (CPU-pinned)                                      │
+  │  ├── spin-polls ticks ring buffer (_mm_pause)                           │
   │  ├── OrderBook  (bid/ask price-level maps, tracked orders)              │
   │  ├── BurstDetector  (16-event sliding window, configurable thresholds)  │
   │  ├── TickProcessor  (EMA + tick-rate window)                            │
-  │  └── on burst: fills AcceleratorBatch → writes to shm                  │
+  │  ├── writes DispatchEvents to orchestrator→dispatcher SPSC ring         │
+  │  ├── reads StrategyOrders from dispatcher→orchestrator SPSC ring        │
+  │  │   └── applies strategy orders to the order book                      │
+  │  └── publishes BookSnapshot to dashboard shm (30 Hz)                    │
   │                          │                                              │
-  │  book snapshot  ◄────────┘  (seqlock, written every N events)          │
-  │        │                                                                │
-  │  GUI thread  (60 hz render loop)                ◄── future              │
-  │  ├── Dear ImGui + ImPlot                                                │
-  │  ├── market book panel  (live bid/ask depth)                            │
-  │  ├── price trend panel  (mid, EMA, spread)                              │
-  │  ├── MM strategy loader  (select + configure strategies)                │
-  │  └── accelerator status  (routing active, signal action, latency)       │
-  └───────────┬─────────────────────────────────────────────────────────────┘
-              │ AcceleratorBatch  (runtime → accelerator)
-              │ AcceleratorSignal (accelerator → runtime)
-              │
-  ┌───────────▼─────────────────────────────────────────────────────────────┐
-  │  accelerator_sim  (process)                                             │
-  │                                                                         │
-  │  current: shared memory IPC                                             │
-  │  ├── spins on batch_sequence_number                                     │
-  │  ├── computes EMA over burst batch                                      │
-  │  ├── emits signal_action (+1 / 0 / -1) + processed_ema                 │
-  │  └── clears routing_active on completion                                │
-  │                                                                         │
-  │  future: VFIO/PCIe (external FPGA)                                      │
-  │  ├── libvfio-user server presenting synthetic PCIe device               │
-  │  ├── BAR0: control/status registers (SUBMIT doorbell, RESULT_READY)     │
-  │  ├── BAR1: hugepage-backed data region (tick batch in, result out)      │
-  │  └── physical target: De1-SoC or similar FPGA over PCIe                │
-  └─────────────────────────────────────────────────────────────────────────┘
+  │  dispatcher thread  (CPU-pinned, separate core)                         │
+  │  ├── polls orchestrator→dispatcher ring for processed events            │
+  │  ├── dispatches to BaseStrategy (tick-by-tick) or                       │
+  │  │   AcceleratorStrategy (burst batches → accelerator_sim)              │
+  │  └── writes StrategyOrders back to orchestrator                         │
+  └───────────┬─────────────────────────────┬───────────────────────────────┘
+              │                             │
+              │ AcceleratorBatch            │ dashboard shm
+              │ AcceleratorSignal           │ (/engine_dashboard_shm)
+              │                             │
+  ┌───────────▼────────────────┐  ┌─────────▼───────────────────────────────┐
+  │  accelerator_sim (proc 3)  │  │  dashboard  (process 4, passive)        │
+  │                            │  │                                         │
+  │  current: shared memory    │  │  reads BookSnapshot via seqlock         │
+  │  ├── spins on batch_seq    │  │  Dear ImGui + ImPlot (GLFW/OpenGL)      │
+  │  ├── computes EMA          │  │  ├── order book panel (bid/ask depth)   │
+  │  ├── emits signal_action   │  │  ├── price/spread/EMA plots             │
+  │  └── clears routing_active │  │  ├── imbalance + micro-trend            │
+  │                            │  │  ├── tick rate + latency (P50/P99)      │
+  │  future: VFIO/PCIe (FPGA)  │  │  └── queue depth + burst indicator      │
+  └────────────────────────────┘  └─────────────────────────────────────────┘
 ```
 
 ---
@@ -71,6 +71,9 @@ SharedMemoryBlock  (/engine_shm_mvp, 1MB, versioned)
   ├── EventRingBuffer        data_sim → runtime      SPSC, 8192 × 64-byte slots
   ├── AcceleratorBatch       runtime → accelerator   64-tick burst batch + metadata
   └── AcceleratorSignal      accelerator → runtime   EMA result, signal action, routing flag
+
+DashboardShmBlock  (/engine_dashboard_shm, 4KB, versioned)
+  └── BookSnapshot           runtime → dashboard     seqlock-protected, written at 30 Hz
 ```
 
 All producer/consumer handshakes use the same acquire/release pattern: payload written relaxed, sequence number written last with release; consumer acquires on sequence, reads payload relaxed.
@@ -83,15 +86,37 @@ Synthetic order flow parameterized per instrument via JSON configs in `configs/`
 
 | process | description |
 |---|---|
-| OU mid-price | Ornstein-Uhlenbeck mean reversion |
-| CIR spread | Cox-Ingersoll-Ross, hard floor at 1 tick |
-| Hawkes arrivals | Self-exciting process, separate bid/ask intensities |
+| RegimeMachine | 3-state Markov chain (CALM/ACTIVE/BURST), single uniform draw per event |
+| OU mid-price | GBM for crypto spot/perp, logit-space random walk for prediction markets |
+| OU spread | Ornstein-Uhlenbeck, hard floor at 1 tick |
 | Limit placement | Truncated geometric distribution from BBO |
 | Marketable limits | Uniform draw through opposing best price, executes then rests |
 | Price impact | Fill size / BBO depth nudges mid-price |
-| Burst mode | Configurable volatility + rate multipliers, Bernoulli onset |
+| SidePool tracking | Fixed-size (512/side), zero heap alloc, eviction emits CANCEL |
+| Crossed/stale sweep | On BBO move, cancel crossed and far-from-BBO orders (budget: 32) |
 
-Available configs: `aapl`, `btc_perp_futures`, `eth_perp_futures`, `sp500_futures`, `eur_spotfx_futures`, `10y_treasury_futures`.
+Available configs: `btc_spot`, `btc_perp`, `eth_perp`, `polymarket_btc_100k`.
+
+---
+
+## strategy interface
+
+The dispatcher thread provides a clean interface for implementing trading strategies:
+
+```cpp
+// Called on every tick in normal mode
+struct BaseStrategy {
+    virtual void on_tick(StrategyContext& ctx) noexcept = 0;
+};
+
+// Called during detected microbursts
+struct AcceleratorStrategy {
+    virtual void on_burst_tick(StrategyContext& ctx) noexcept = 0;
+    virtual void on_burst_end(StrategyContext& ctx) noexcept = 0;
+};
+```
+
+`StrategyContext` provides read-only market state (BBO, spread, EMA, burst stats) and a write interface (`place_limit`, `cancel`) that queues orders back to the orchestrator's book via the dispatcher→orchestrator ring.
 
 ---
 
@@ -99,9 +124,10 @@ Available configs: `aapl`, `btc_perp_futures`, `eth_perp_futures`, `sp500_future
 
 | binary | role |
 |---|---|
-| `data_sim` | generates synthetic order events, writes to ring buffer |
-| `runtime_engine` | consumes ring buffer, maintains order book, detects bursts, routes to accelerator |
+| `data_sim` | generates synthetic order events, writes to ticks ring buffer |
+| `runtime_engine` | orchestrator (book reconstruction, snapshots) + dispatcher (strategy execution) |
 | `accelerator_sim` | consumes burst batches, computes signal, returns result |
+| `dashboard` | standalone GUI process, reads snapshots from dashboard shared memory |
 | `data_test` | standalone calibration run — prints event stream + stats summary |
 | `order_book_test` | unit tests for the order book |
 
@@ -110,20 +136,20 @@ Available configs: `aapl`, `btc_perp_futures`, `eth_perp_futures`, `sp500_future
 ## roadmap
 
 ### complete
-- Stochastic data generator (OU + CIR + Hawkes) with burst mode
+- Stochastic data generator (RegimeMachine + OU) with per-asset-class dynamics
 - SPSC ring buffer over POSIX shared memory
 - Runtime order book (bid/ask level maps, tracked orders)
 - Microburst detector (sliding window inter-arrival mean, hysteresis)
 - Accelerator batch offload over shared memory (EMA + directional signal)
 - Marketable limit orders with immediate execution and passive residual resting
+- Dear ImGui + ImPlot dashboard (order book, price plots, latency, imbalance)
 
-### next: dashboard (Dear ImGui)
-- GUI thread in the runtime_engine process reads a seqlock book snapshot at 60 hz
-- Market book panel: live bid/ask depth up to N levels
-- Price trend panel: mid price, EMA, spread over time (ImPlot scrolling buffer)
-- Instrument config picker: load any `configs/*.json` at runtime
-- MM strategy panel: select and configure strategy parameters
-- Accelerator status panel: routing active, signal action, round-trip latency histogram
+### in progress
+- Fix order book corruption (level erasure bug in on_execute, ADD_LIMIT_MKT drop)
+- Decouple GUI into standalone dashboard process with dedicated shared memory
+- Split runtime engine into orchestrator + dispatcher threads (CPU-pinned)
+- BaseStrategy / AcceleratorStrategy interfaces with StrategyContext
+- Dispatcher→orchestrator order writeback for strategy impact on book
 
 ### future: market-making strategy
 - Micro-price fair value (volume-weighted mid)
@@ -159,9 +185,10 @@ Requires C++23, CMake 3.20+, Linux (POSIX shm, `_mm_pause`).
 Start processes in order (each opens shm after the previous creates it):
 
 ```sh
+./build/data_sim configs/btc_perp.json &
 ./build/runtime_engine &
 ./build/accelerator_sim &
-./build/data_sim configs/btc_perp_futures.json
+./build/dashboard &
 ```
 
 Or run the standalone calibration test without shared memory:
