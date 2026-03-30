@@ -10,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include "spin_pause.hpp"
+#include "tsc.hpp"
 
 #include "shm_manager.hpp"
 #include "shm_types.hpp"
@@ -133,11 +134,11 @@ public:
 private:
     static double calibrate_tsc_ns_per_cycle() noexcept {
         using clock = std::chrono::steady_clock;
-        (void)__rdtsc();  // warm up
+        (void)READ_TSC();  // warm up
         auto wall_start   = clock::now();
-        uint64_t tsc_start = __rdtsc();
+        uint64_t tsc_start = READ_TSC();
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        uint64_t tsc_end  = __rdtsc();
+        uint64_t tsc_end  = READ_TSC();
         auto wall_end     = clock::now();
         double elapsed_ns  = (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  wall_end - wall_start).count();
@@ -260,7 +261,7 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
             int64_t bid = book_.best_bid();
             int64_t ask = book_.best_ask();
             int64_t mid = (bid && ask) ? (bid + ask) / 2 : (bid | ask);
-            uint64_t received_tsc = __rdtsc();
+            uint64_t received_tsc = READ_TSC();
             uint64_t received_at  = (uint64_t)(received_tsc * tsc_to_ns_);
 
             detector_.on_tick(slot.timestamp_ns);

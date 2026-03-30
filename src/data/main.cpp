@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "spin_pause.hpp"
+#include "../common/tsc.hpp"
 
 #include "../common/shm_manager.hpp"
 #include "../common/shm_types.hpp"
@@ -111,7 +112,7 @@ int main(int argc, char* argv[]) {
 
             auto& slot         = ring.slots[h & engine::shm::EVENT_RING_MASK];
             slot.sequence      = h + 1;
-            slot.enqueue_tsc   = __rdtsc();
+            slot.enqueue_tsc   = READ_TSC();
             slot.timestamp_ns  = ev.timestamp_ns;
             slot.order_id      = ev.order_id;
             slot.price         = ev.price;

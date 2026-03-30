@@ -58,7 +58,7 @@ struct alignas(64) AcceleratorSignal {
 struct alignas(64) ShmOrderEvent {
     uint64_t sequence;        // monotonic; 0 = unwritten
     uint64_t timestamp_ns;    // simulated Hawkes process time (not wall clock)
-    uint64_t enqueue_tsc;     // TSC cycles (__rdtsc) at ring write — for latency measurement
+    uint64_t enqueue_tsc;     // TSC cycles (READ_TSC) at ring write — for latency measurement
     uint64_t order_id;
     int64_t  price;           // the ORDER's quoted price, fixed-point × PRICE_SCALE
                               // (limit price for ADD_LIMIT/CANCEL, fill price for EXECUTE, 0 for ADD_MARKET)
