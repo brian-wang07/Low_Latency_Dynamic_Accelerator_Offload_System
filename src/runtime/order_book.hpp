@@ -6,11 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-struct PriceLevel {
-    int64_t  price;
-    int64_t  total_qty;
-    uint32_t order_count;
-};
+#include "price_level.hpp"
 
 struct TrackedOrder {
     uint64_t order_id;

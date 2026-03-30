@@ -1,6 +1,4 @@
 #include <iostream>
-#include <string>
-
 #include <sys/mman.h> //shm 
 #include <sys/stat.h> //mode constants
 #include <fcntl.h>    //O_* constants
@@ -26,7 +24,7 @@ bool ShmManager::create() {
   }
 
   //set size of shm block to SHM_SIZE (1 mb). ftruncate() returns -1 on error, and is declarative
-  if (ftruncate(fd_, engine::shm::SHM_SIZE) == -1) {
+  if (ftruncate(fd_, common::shm::SHM_SIZE) == -1) {
     ::close(fd_);
     shm_unlink(name_.c_str());
     fd_ = -1;
@@ -34,9 +32,10 @@ bool ShmManager::create() {
   }
 
   //map p to the memory block. set addr as nullptr, to let kernel figure out location. 
-  void *p = mmap(nullptr, engine::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+  void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
   if (p == MAP_FAILED) {
     ::close(fd_);
+
     shm_unlink(name_.c_str());
     fd_ = -1;
     return false;
@@ -45,9 +44,9 @@ bool ShmManager::create() {
   addr_ = p;
   owner_ = true;
   is_valid_ = true;
-  size_ = engine::shm::SHM_SIZE;
+  size_ = common::shm::SHM_SIZE;
   std::memset(addr_, 0, size_);
-  engine::shm::shm_init_header(static_cast<engine::shm::SharedMemoryBlock*>(addr_));
+  common::shm::shm_init_header(static_cast<common::shm::SharedMemoryBlock*>(addr_));
   return true;
 }
 
@@ -63,20 +62,20 @@ bool ShmManager::open() {
     return false;
   }
 
-  void *p = mmap(nullptr, engine::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+  void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
   if (p == MAP_FAILED) {
     ::close(fd_);
     fd_ = -1;
     return false;
   }
   
-  auto* block = static_cast<engine::shm::SharedMemoryBlock*>(p);
-  if (!engine::shm::shm_validate_header(block)) {
+  auto* block = static_cast<common::shm::SharedMemoryBlock*>(p);
+  if (!common::shm::shm_validate_header(block)) {
       std::cerr << "shm_open: layout mismatch (magic=" << block->header.magic
                 << " version=" << block->header.version
-                << "), expected magic=" << engine::shm::SHM_MAGIC
-                << " version=" << engine::shm::SHM_VERSION << '\n';
-      munmap(p, engine::shm::SHM_SIZE);
+                << "), expected magic=" << common::shm::SHM_MAGIC
+                << " version=" << common::shm::SHM_VERSION << '\n';
+      munmap(p, common::shm::SHM_SIZE);
       ::close(fd_);
       fd_ = -1;
       return false;
@@ -85,7 +84,7 @@ bool ShmManager::open() {
   addr_ = p;
   owner_ = false;
   is_valid_ = true;
-  size_ = engine::shm::SHM_SIZE;
+  size_ = common::shm::SHM_SIZE;
   return true;
 }
 

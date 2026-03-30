@@ -1,8 +1,8 @@
 #pragma once
 #include <csignal>
-#include "book_snapshot.hpp"
+#include "../common/shm_types.hpp"
 
 class DisplayThread {
 public:
-    void run(const BookSnapshot& snapshot, volatile sig_atomic_t& running);
+    void run(const dashboard::shm::BookSnapshot& snapshot, volatile sig_atomic_t& running);
 };

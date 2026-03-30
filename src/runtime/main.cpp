@@ -13,7 +13,7 @@ int main() {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    alignas(64) BookSnapshot snapshot{};
+    alignas(64) dashboard::shm::BookSnapshot snapshot{};
 
     RuntimeEngine<> engine;
     std::thread engine_thread([&] {

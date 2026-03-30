@@ -14,9 +14,9 @@
 
 #include "shm_manager.hpp"
 #include "shm_types.hpp"
+#include "runtime_engine_types.hpp"
 #include "order_book.hpp"
 #include "book_snapshot.hpp"
-#include "engine_types.hpp"
 
 struct LatencyTracker {
     // Collect raw samples per 64-event snapshot window.
@@ -129,7 +129,7 @@ class RuntimeEngine {
 public:
     explicit RuntimeEngine(Handler handler = Handler{}) :
         handler_(std::move(handler)) {}
-    void run(volatile sig_atomic_t& running, BookSnapshot& snapshot);
+    void run(volatile sig_atomic_t& running, dashboard::shm::BookSnapshot& snap);
 
 private:
     static double calibrate_tsc_ns_per_cycle() noexcept {
@@ -157,24 +157,24 @@ private:
     uint64_t last_ring_tail_ = 0;
 
     // accelerator batch accumulation
-    engine::shm::AcceleratorTick pending_batch_[engine::shm::BATCH_SIZE]{};
+    accelerator::AcceleratorTick pending_batch_[accelerator::BATCH_SIZE]{};
     uint32_t pending_count_         = 0;
     uint64_t last_batch_seq_        = 0;
     uint64_t last_result_seq_       = 0;
     uint64_t prev_tick_received_at_ = 0;
     bool     was_in_burst_          = false;
 
-    void flush_batch(engine::shm::SharedMemoryBlock* block, uint64_t seq);
-    void publish_snapshot(BookSnapshot &snap, uint64_t seq); 
+    void flush_batch(common::shm::SharedMemoryBlock* block, uint64_t seq);
+    void publish_snapshot(dashboard::shm::BookSnapshot &snap, uint64_t seq); 
 };
 
 
 template<EventHandler H>
-void RuntimeEngine<H>::publish_snapshot(BookSnapshot& snap, uint64_t seq) {
+void RuntimeEngine<H>::publish_snapshot(dashboard::shm::BookSnapshot& snap, uint64_t seq) {
     auto [p50, p99] = lat_tracker_.p50_p99_us();
     lat_tracker_.reset();
 
-    snapshot_begin_write(snap);
+    dashboard::shm::snapshot_begin_write(snap);
     snap.best_bid             = book_.best_bid();
     snap.best_ask             = book_.best_ask();
     snap.spread               = book_.spread();
@@ -185,22 +185,22 @@ void RuntimeEngine<H>::publish_snapshot(BookSnapshot& snap, uint64_t seq) {
     snap.ema                  = processor_.ema();
     snap.tick_rate            = processor_.tick_rate();
     snap.in_burst             = detector_.in_burst();
-    snap.bid_level_count      = (uint32_t)book_.bid_depth(snap.bids, SNAPSHOT_DEPTH);
-    snap.ask_level_count      = (uint32_t)book_.ask_depth(snap.asks, SNAPSHOT_DEPTH);
+    snap.bid_level_count      = (uint32_t)book_.bid_depth(snap.bids, dashboard::shm::SNAPSHOT_DEPTH);
+    snap.ask_level_count      = (uint32_t)book_.ask_depth(snap.asks, dashboard::shm::SNAPSHOT_DEPTH);
     snap.event_sequence       = seq;
     snap.latency_p50_us       = p50;
     snap.latency_p99_us       = p99;
-    snap.ring_occupancy       = double(shm_.as<engine::shm::SharedMemoryBlock>()->event_ring.head.load(std::memory_order_relaxed)
-                                     - shm_.as<engine::shm::SharedMemoryBlock>()->event_ring.tail.load(std::memory_order_relaxed))
-                                / double(engine::shm::EVENT_RING_CAPACITY);
+    snap.ring_occupancy       = double(shm_.as<common::shm::SharedMemoryBlock>()->market_data_feed.head.load(std::memory_order_relaxed)
+                                     - shm_.as<common::shm::SharedMemoryBlock>()->market_data_feed.tail.load(std::memory_order_relaxed))
+                                / double(runtime::shm::EVENT_RING_CAPACITY);
     snap.burst_threshold_tps  = detector_.threshold_tps();
-    snapshot_end_write(snap);
+    dashboard::shm::snapshot_end_write(snap);
 }
 
 
 template <EventHandler H>
-void RuntimeEngine<H>::flush_batch(engine::shm::SharedMemoryBlock* block, uint64_t seq) {
-    auto& batch = block->data_to_accelerator;
+void RuntimeEngine<H>::flush_batch(common::shm::SharedMemoryBlock* block, uint64_t seq) {
+    auto& batch = block->accelerator_feed;
     batch.burst_meta.tick_count = pending_count_;
     for (uint32_t i = 0; i < pending_count_; ++i)
         batch.ticks[i] = pending_batch_[i];
@@ -213,7 +213,7 @@ void RuntimeEngine<H>::flush_batch(engine::shm::SharedMemoryBlock* block, uint64
 }
 
 template <EventHandler H>
-void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapshot) {
+void RuntimeEngine<H>::run(volatile sig_atomic_t& running, dashboard::shm::BookSnapshot& snapshot) {
     std::cout << "Calibrating TSC...\n";
     tsc_to_ns_ = calibrate_tsc_ns_per_cycle();
     std::cout << "TSC: " << tsc_to_ns_ << " ns/cycle\n";
@@ -224,8 +224,8 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
     }
     std::cout << "Attached to shared memory. Polling...\n";
 
-    auto* block = shm_.as<engine::shm::SharedMemoryBlock>();
-    auto& ring  = block->event_ring;
+    auto* block = shm_.as<common::shm::SharedMemoryBlock>();
+    auto& ring  = block->market_data_feed;
     uint64_t events_since_snapshot = 0;
     uint64_t last_seq = 0;
 
@@ -237,7 +237,7 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
         }
 
         while (last_ring_tail_ < head) {
-            const auto& slot = ring.slots[last_ring_tail_ & engine::shm::EVENT_RING_MASK];
+            const auto& slot = ring.slots[last_ring_tail_ & runtime::shm::EVENT_RING_MASK];
 
             // book dispatch
             switch (slot.type) {
@@ -276,8 +276,8 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
                 uint64_t delta = (prev_tick_received_at_ > 0)
                     ? received_at - prev_tick_received_at_ : 0;
 
-                if (pending_count_ < engine::shm::BATCH_SIZE) {
-                    pending_batch_[pending_count_++] = engine::shm::AcceleratorTick{
+                if (pending_count_ < accelerator::BATCH_SIZE) {
+                    pending_batch_[pending_count_++] = accelerator::AcceleratorTick{
                         .sequence_number  = slot.sequence,
                         .price            = mid,
                         .arrival_delta_ns = delta,
@@ -285,12 +285,12 @@ void RuntimeEngine<H>::run(volatile sig_atomic_t& running, BookSnapshot& snapsho
                 }
 
                 if (!was_in_burst_) {
-                    auto& batch = block->data_to_accelerator;
+                    auto& batch = block->accelerator_feed;
                     batch.burst_meta.burst_entry_time_ns = received_at;
                     batch.burst_meta.ema_at_entry        = processor_.ema();
                 }
 
-                if (pending_count_ == engine::shm::BATCH_SIZE)
+                if (pending_count_ == accelerator::BATCH_SIZE)
                     flush_batch(block, slot.sequence);
             } else {
                 if (was_in_burst_) {

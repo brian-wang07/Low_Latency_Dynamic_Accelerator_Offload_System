@@ -87,13 +87,13 @@ int main(int argc, char* argv[]) {
         auto last_print = clock::now();
         uint64_t ticks_since_print = 0;
 
-        auto* block = shm.as<engine::shm::SharedMemoryBlock>();
-        auto& ring  = block->event_ring;
+        auto* block = shm.as<common::shm::SharedMemoryBlock>();
+        auto& ring  = block->market_data_feed;
 
         // signal runtime to reset book state
         {
             uint64_t h = ring.head.load(std::memory_order_relaxed);
-            auto& slot = ring.slots[h & engine::shm::EVENT_RING_MASK];
+            auto& slot = ring.slots[h & runtime::shm::EVENT_RING_MASK];
             slot.sequence = h + 1;
             slot.type = static_cast<uint8_t>(EventType::RESET);
             ring.head.store(h + 1, std::memory_order_release);
@@ -105,12 +105,12 @@ int main(int argc, char* argv[]) {
 
             // spin-wait until ring has space (never drop events)
             uint64_t h = ring.head.load(std::memory_order_relaxed);
-            while (h - ring.tail.load(std::memory_order_acquire) >= engine::shm::EVENT_RING_CAPACITY) {
+            while (h - ring.tail.load(std::memory_order_acquire) >= runtime::shm::EVENT_RING_CAPACITY) {
                 SPIN_PAUSE();
                 if (!g_running) goto done;
             }
 
-            auto& slot         = ring.slots[h & engine::shm::EVENT_RING_MASK];
+            auto& slot         = ring.slots[h & runtime::shm::EVENT_RING_MASK];
             slot.sequence      = h + 1;
             slot.enqueue_tsc   = READ_TSC();
             slot.timestamp_ns  = ev.timestamp_ns;

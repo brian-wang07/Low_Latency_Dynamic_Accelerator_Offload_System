@@ -1,5 +1,5 @@
 #include "display_thread.hpp"
-#include "engine_types.hpp"
+#include "../common/runtime_engine_types.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -57,7 +57,7 @@ struct PlotRing {
     int ins = 0;
     int sz  = 0;
 
-    void push(float t_now, const BookSnapshot& s) {
+    void push(float t_now, const dashboard::shm::BookSnapshot& s) {
         t[ins]           = t_now;
         bid[ins]         = (float)to_display(s.best_bid);
         ask[ins]         = (float)to_display(s.best_ask);
@@ -106,13 +106,13 @@ static std::pair<float,float> ring_range(const float* ys, int sz, int oldest,
 // ---------------------------------------------------------------------------
 // Plot 1: Best Bid + Best Ask + VWMID (three lines, legend on)
 // ---------------------------------------------------------------------------
-static void plot_price_trio(const BookSnapshot& s, const PlotRing& ring,
+static void plot_price_trio(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                              int sz, int oldest, float t_now, ImVec2 psz)
 {
     char bbuf[64], abuf[64], vbuf[64];
-    std::snprintf(bbuf, sizeof(bbuf), "Bid: %.6f", to_display(s.best_bid));
-    std::snprintf(abuf, sizeof(abuf), "  Ask: %.6f", to_display(s.best_ask));
-    std::snprintf(vbuf, sizeof(vbuf), "  VWMID: %.6f", s.vwmid);
+    std::snprintf(bbuf, sizeof(bbuf), "Bid: %.4f", to_display(s.best_bid));
+    std::snprintf(abuf, sizeof(abuf), "  Ask: %.4f", to_display(s.best_ask));
+    std::snprintf(vbuf, sizeof(vbuf), "  VWMID: %.4f", s.vwmid);
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.9f, 0.2f, 1.f));
     ImGui::TextUnformatted(bbuf);
@@ -178,7 +178,7 @@ static void plot_price_trio(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Plot 2: Microtrend — (EMA - VWMID) area oscillator
 // ---------------------------------------------------------------------------
-static void plot_microtrend(const BookSnapshot& s, const PlotRing& ring,
+static void plot_microtrend(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                              int sz, int oldest, float t_now, ImVec2 psz)
 {
     double cur = to_display(s.ema) - s.vwmid;
@@ -226,7 +226,7 @@ static void plot_microtrend(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Plot 3: Imbalance — raw (thin/faint) + EMA (thick/bold)
 // ---------------------------------------------------------------------------
-static void plot_imbalance(const BookSnapshot& s, const PlotRing& ring,
+static void plot_imbalance(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                             int sz, int oldest, float t_now, ImVec2 psz)
 {
     char lbuf[64];
@@ -254,7 +254,7 @@ static void plot_imbalance(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Plot 4: Tick rate
 // ---------------------------------------------------------------------------
-static void plot_tickrate(const BookSnapshot& s, const PlotRing& ring,
+static void plot_tickrate(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                            int sz, int oldest, float t_now, ImVec2 psz)
 {
     char lbuf[64];
@@ -281,7 +281,7 @@ static void plot_tickrate(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Plot 5: E2E Latency — P50 and P99
 // ---------------------------------------------------------------------------
-static void plot_latency(const BookSnapshot& s, const PlotRing& ring,
+static void plot_latency(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                           int sz, int oldest, float t_now, ImVec2 psz)
 {
     char lbuf[128];
@@ -318,7 +318,7 @@ static void plot_latency(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Plot 6: Queue depth — ring buffer occupancy area chart 0-100%
 // ---------------------------------------------------------------------------
-static void plot_queue_depth(const BookSnapshot& s, const PlotRing& ring,
+static void plot_queue_depth(const dashboard::shm::BookSnapshot& s, const PlotRing& ring,
                               int sz, int oldest, float t_now, ImVec2 psz)
 {
     float pct = (float)(s.ring_occupancy * 100.0);
@@ -351,7 +351,7 @@ static void plot_queue_depth(const BookSnapshot& s, const PlotRing& ring,
 // ---------------------------------------------------------------------------
 // Order book — 6-column table, spread centered in large font
 // ---------------------------------------------------------------------------
-static void render_book(const BookSnapshot& s) {
+static void render_book(const dashboard::shm::BookSnapshot& s) {
     // Centered, large spread
     {
         char spread_buf[64];
@@ -397,7 +397,7 @@ static void render_book(const BookSnapshot& s) {
         ImGui::TableSetupColumn("ASK PRICE");
         ImGui::TableHeadersRow();
 
-        for (uint32_t i = 0; i < SNAPSHOT_DEPTH; ++i) {
+        for (uint32_t i = 0; i < dashboard::shm::SNAPSHOT_DEPTH; ++i) {
             ImGui::TableNextRow();
 
             // Quantity bars drawn behind this row
@@ -446,7 +446,7 @@ static void render_book(const BookSnapshot& s) {
 // ---------------------------------------------------------------------------
 // 3x2 grid of metric plots
 // ---------------------------------------------------------------------------
-static void render_plots(const BookSnapshot& s, const PlotRing& ring) {
+static void render_plots(const dashboard::shm::BookSnapshot& s, const PlotRing& ring) {
     const float avail_w = ImGui::GetContentRegionAvail().x;
     const float avail_h = ImGui::GetContentRegionAvail().y;
     const float gap     = 8.f;
@@ -488,7 +488,7 @@ static void render_plots(const BookSnapshot& s, const PlotRing& ring) {
 // ---------------------------------------------------------------------------
 // DisplayThread::run
 // ---------------------------------------------------------------------------
-void DisplayThread::run(const BookSnapshot& snapshot, volatile sig_atomic_t& running) {
+void DisplayThread::run(const dashboard::shm::BookSnapshot& snapshot, volatile sig_atomic_t& running) {
     glfwSetErrorCallback([](int code, const char* desc) {
         std::fprintf(stderr, "GLFW error %d: %s\n", code, desc);
     });
@@ -536,8 +536,8 @@ void DisplayThread::run(const BookSnapshot& snapshot, volatile sig_atomic_t& run
 #endif
     ImGui::GetStyle().Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.95f, 1.0f);
 
-    BookSnapshot local{};
-    BookSnapshot book_local{};
+    dashboard::shm::BookSnapshot local{};
+    dashboard::shm::BookSnapshot book_local{};
     PlotRing     ring{};
     double       last_book_update = 0.0;
 
@@ -545,13 +545,13 @@ void DisplayThread::run(const BookSnapshot& snapshot, volatile sig_atomic_t& run
         glfwPollEvents();
 
         double t_now = glfwGetTime();
-        if (snapshot_read(snapshot, local)) {
+        if (dashboard::shm::snapshot_read(snapshot, local)) {
             ring.push((float)t_now, local);
             if (t_now - last_book_update >= BOOK_UPDATE_INTERVAL) {
                 std::memcpy(
                     reinterpret_cast<char*>(&book_local)  + sizeof(std::atomic<uint64_t>),
                     reinterpret_cast<const char*>(&local) + sizeof(std::atomic<uint64_t>),
-                    sizeof(BookSnapshot) - sizeof(std::atomic<uint64_t>));
+                    sizeof(dashboard::shm::BookSnapshot) - sizeof(std::atomic<uint64_t>));
                 last_book_update = t_now;
             }
         }

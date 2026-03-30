@@ -38,7 +38,7 @@ public:
 
 
 private:
-    std::string name_ = engine::shm::SHM_NAME;
+    std::string name_ = common::shm::SHM_NAME;
     int fd_ = -1;
     void *addr_ = nullptr;
     std::size_t size_ = 0;

@@ -1,5 +1,7 @@
-# low-latency engine
-
+# low latency engine
+<p align="center">
+  <img src="./assets/dashboard-animation.gif"/>
+</p>
 A userspace market-making engine with synthetic order flow, microburst detection, and hardware accelerator offload. The system streams a realistic order book over shared memory at low latency, detects microbursts in real time, and offloads computationally intensive strategy work to a separate accelerator — eventually a physical FPGA via VFIO/PCIe.
 
 ---
@@ -7,58 +9,40 @@ A userspace market-making engine with synthetic order flow, microburst detection
 ## architecture
 
 ```
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │  data_sim  (process 1)                                                  │
-  │                                                                         │
-  │  DataGenerator                                                          │
-  │  ├── RegimeMachine (CALM → ACTIVE → BURST state machine)                │
-  │  ├── OU mid-price (GBM for crypto, logit-space for prediction markets)  │
-  │  ├── OU spread (plain OU, hard floor at 1 tick)                         │
-  │  ├── Truncated geometric limit order placement                          │
-  │  ├── Marketable limit orders (ADD_LIMIT_MKT)                            │
-  │  ├── Market orders w/ price impact                                      │
-  │  ├── SidePool order tracking (fixed-size, zero heap alloc)              │
-  │  └── Crossed/stale order sweep on BBO move                              │
-  │                          │                                              │
-  │                          │  EventRingBuffer (SPSC, 8192 slots)          │
-  │                          │  ShmOrderEvent: ADD_LIMIT / ADD_LIMIT_MKT /  │
-  │                          │  ADD_MARKET / CANCEL / EXECUTE               │
-  └──────────────────────────┼──────────────────────────────────────────────┘
-                             │ POSIX shared memory  (/engine_shm_mvp)
-  ┌──────────────────────────▼──────────────────────────────────────────────┐
-  │  runtime_engine  (process 2, two pinned threads)                        │
-  │                                                                         │
-  │  orchestrator thread  (CPU-pinned)                                      │
-  │  ├── spin-polls ticks ring buffer (_mm_pause)                           │
-  │  ├── OrderBook  (bid/ask price-level maps, tracked orders)              │
-  │  ├── BurstDetector  (16-event sliding window, configurable thresholds)  │
-  │  ├── TickProcessor  (EMA + tick-rate window)                            │
-  │  ├── writes DispatchEvents to orchestrator→dispatcher SPSC ring         │
-  │  ├── reads StrategyOrders from dispatcher→orchestrator SPSC ring        │
-  │  │   └── applies strategy orders to the order book                      │
-  │  └── publishes BookSnapshot to dashboard shm (30 Hz)                    │
-  │                          │                                              │
-  │  dispatcher thread  (CPU-pinned, separate core)                         │
-  │  ├── polls orchestrator→dispatcher ring for processed events            │
-  │  ├── dispatches to BaseStrategy (tick-by-tick) or                       │
-  │  │   AcceleratorStrategy (burst batches → accelerator_sim)              │
-  │  └── writes StrategyOrders back to orchestrator                         │
-  └───────────┬─────────────────────────────┬───────────────────────────────┘
-              │                             │
-              │ AcceleratorBatch            │ dashboard shm
-              │ AcceleratorSignal           │ (/engine_dashboard_shm)
-              │                             │
-  ┌───────────▼────────────────┐  ┌─────────▼───────────────────────────────┐
-  │  accelerator_sim (proc 3)  │  │  dashboard  (process 4, passive)        │
-  │                            │  │                                         │
-  │  current: shared memory    │  │  reads BookSnapshot via seqlock         │
-  │  ├── spins on batch_seq    │  │  Dear ImGui + ImPlot (GLFW/OpenGL)      │
-  │  ├── computes EMA          │  │  ├── order book panel (bid/ask depth)   │
-  │  ├── emits signal_action   │  │  ├── price/spread/EMA plots             │
-  │  └── clears routing_active │  │  ├── imbalance + micro-trend            │
-  │                            │  │  ├── tick rate + latency (P50/P99)      │
-  │  future: VFIO/PCIe (FPGA)  │  │  └── queue depth + burst indicator      │
-  └────────────────────────────┘  └─────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐                                                                   
+│              EXCHANGE (Process 1)              │                                                                   
+│                                                │                                                                   
+│     [CREATOR]───────HEAP────────►[DISPATCHER]──┼─────────┐ 
+│                                                │         │   
+│   [ADVERSARIES]────────────────────────────────┼──────┐  │  give each producer its own spsc ring,                       
+│                                                │     ┌▼──▼┐ and k-way merge on the enqueue timestamp.
+│ [MATCHING ENGINE]◄─────────────────────────────┼─────┤SPSC◄─────┐                                                  
+│         │                                      │     └────┘     │                                                  
+└─────────┼──────────────────────────────────────┘    EXCHANGE    │                                                  
+       ┌──▼─┐                                                     │                                                  
+       │SPSC│ENGINE                                               │                                                  
+       └──┬─┘                                                     │                                                  
+┌─────────┼──────────────────────────────────────┐                │                                                  
+│         │ RUNTIME ENGINE (Process 2)           │                │                                                  
+│         │                                      │ DASHBOARD      │                                                  
+│         ▼         ┌───────┐                    │ ┌────┐         │                                                  
+│    [HOT PATH]─────►Seqlock┼────►[SNAPSHOTTER]──┼─►SPSC│         │                                                  
+│         │         └───────┘                    │ └──┬─┘         │                                                  
+└─────────┼──────────────────────────────────────┘    │           │                                                  
+          │                                           │           │                                                  
+       ┌──▼─┐                      ┌──────────────────┴──┐        │                                                  
+       │SPSC│STRATEGY              │DASHBOARD (Process 4)│        │                                                  
+       └──┬─┘                      └─────────────────────┘        │                                                  
+          │                                                       │                                                  
+┌─────────┼──────────────────────────────────────┐                │                                                  
+│         │    STRATEGY (Process 3)              │                │                                                  
+│         ▼   Dispatch to main or offload        │                │                                                  
+│   [DISPATCHER]───────────────────────►[MAIN]   │                │                                                  
+│         │                                │     │                │                                                  
+│         ▼                                │     │                │                                                  
+│   [ACCELERATOR]──────────────────────────┴─────┼────────────────┘                                                  
+│                                                │                                                                   
+└────────────────────────────────────────────────┘                                                                   
 ```
 
 ---
@@ -66,14 +50,14 @@ A userspace market-making engine with synthetic order flow, microburst detection
 ## shared memory layout
 
 ```
-SharedMemoryBlock  (/engine_shm_mvp, 1MB, versioned)
+SharedMemoryBlock  (/engine_shm_mvp, 16MB, versioned)
   ├── ShmHeader              magic + version check (fail-fast on mismatch)
-  ├── EventRingBuffer        data_sim → runtime      SPSC, 8192 × 64-byte slots
-  ├── AcceleratorBatch       runtime → accelerator   64-tick burst batch + metadata
-  └── AcceleratorSignal      accelerator → runtime   EMA result, signal action, routing flag
-
-DashboardShmBlock  (/engine_dashboard_shm, 4KB, versioned)
-  └── BookSnapshot           runtime → dashboard     seqlock-protected, written at 30 Hz
+  ├── ExchangeInputArray     producers → matching engine   2 × SPSC, 4096 × 64-byte slots
+  ├── EventRingBuffer        matching engine → runtime     SPSC, 8192 × 64-byte slots
+  ├── StrategyRingBuffer     runtime → strategy            SPSC, 4096 × StrategyTick slots
+  ├── BookSnapshot           runtime → dashboard           seqlock-protected, written at 30 Hz
+  ├── AcceleratorBatch       runtime → accelerator         64-tick burst batch + metadata
+  └── AcceleratorSignal      accelerator → runtime         EMA result, signal action, routing flag
 ```
 
 All producer/consumer handshakes use the same acquire/release pattern: payload written relaxed, sequence number written last with release; consumer acquires on sequence, reads payload relaxed.
