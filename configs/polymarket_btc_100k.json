@@ -1,0 +1,34 @@
+{
+  "asset_type": "prediction_market",
+  "symbol": "BTC-100K-JUN25",
+  "pm_init_prob": 0.62,
+  "pm_resolve_drift": 0.0,
+
+  "base_interval_ns": 500,
+  "burst_interval_ns": 50,
+  "daily_volatility": 0.05,
+  "mean_reversion_speed": 0.02,
+  "burst_probability": 0.08,
+  "burst_volatility_multiplier": 4.0,
+  "seed": 99,
+
+  "mu_0": 0.62,
+  "tick_size": 0.001,
+  "kappa_s": 8.0,
+  "theta_s": 0.8,
+  "xi": 0.10,
+
+  "p_add_limit": 0.70,
+  "p_cancel": 0.22,
+  "p_add_market": 0.05,
+  "p_add_limit_mkt": 0.03,
+  "geom_p": 0.50,
+  "max_offset_ticks": 5,
+
+  "qty_log_mean": 5.5,
+  "qty_log_sigma": 0.7,
+  "lot_size": 1,
+  "impact_coeff": 0.002,
+  "burst_length": 8,
+  "jitter_sigma": 0.40
+}

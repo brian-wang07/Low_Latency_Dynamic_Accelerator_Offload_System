@@ -1,0 +1,32 @@
+{
+  "asset_type": "crypto_spot",
+  "symbol": "BTC-USDT",
+
+  "base_interval_ns": 50,
+  "burst_interval_ns": 5,
+  "daily_volatility": 0.04,
+  "mean_reversion_speed": 0.005,
+  "burst_probability": 0.12,
+  "burst_volatility_multiplier": 8.0,
+  "seed": 42,
+
+  "mu_0": 95000.0,
+  "tick_size": 0.1,
+  "kappa_s": 4.0,
+  "theta_s": 1.5,
+  "xi": 0.20,
+
+  "p_add_limit": 0.68,
+  "p_cancel": 0.22,
+  "p_add_market": 0.07,
+  "p_add_limit_mkt": 0.03,
+  "geom_p": 0.40,
+  "max_offset_ticks": 8,
+
+  "qty_log_mean": 1.5,
+  "qty_log_sigma": 0.9,
+  "lot_size": 1,
+  "impact_coeff": 0.012,
+  "burst_length": 15,
+  "jitter_sigma": 0.30
+}

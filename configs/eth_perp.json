@@ -1,0 +1,33 @@
+{
+  "asset_type": "crypto_perp",
+  "symbol": "ETH-PERP",
+  "funding_rate_8h": 0.00008,
+
+  "base_interval_ns": 60,
+  "burst_interval_ns": 6,
+  "daily_volatility": 0.065,
+  "mean_reversion_speed": 0.008,
+  "burst_probability": 0.15,
+  "burst_volatility_multiplier": 10.0,
+  "seed": 44,
+
+  "mu_0": 3500.0,
+  "tick_size": 0.01,
+  "kappa_s": 4.0,
+  "theta_s": 1.5,
+  "xi": 0.25,
+
+  "p_add_limit": 0.68,
+  "p_cancel": 0.22,
+  "p_add_market": 0.07,
+  "p_add_limit_mkt": 0.03,
+  "geom_p": 0.42,
+  "max_offset_ticks": 8,
+
+  "qty_log_mean": 3.5,
+  "qty_log_sigma": 0.85,
+  "lot_size": 1,
+  "impact_coeff": 0.010,
+  "burst_length": 18,
+  "jitter_sigma": 0.32
+}

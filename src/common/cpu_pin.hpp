@@ -9,6 +9,16 @@
     #include <sched.h>
 #endif
 
+//| Core | Thread | Notes |
+//|----- |--------|-------|
+//|  0   | Matching Engine | Hottest — polls all input rings |
+//|  1   | Data Dispatcher | Clock-driven, sleeps between events |
+//|  2   | Runtime Hot Path | Book reconstruction + strategy feed |
+//|  3   | Strategy | Decision loop |
+//|  4   | Data Creator | Batch precompute, not latency-critical |
+//|  5   | Snapshotter + Dashboard | Cool threads, can share |
+
+//TODO: Fix sibling cores; cores (0, 1) share cpu 0. maybe this is fine tho? idk check
 
 inline bool pin_to_core(int core_id) noexcept {
 #ifdef __APPLE__

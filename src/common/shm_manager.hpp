@@ -44,4 +44,5 @@ private:
     std::size_t size_ = 0;
     bool owner_ = false;
     bool is_valid_ = false;
+    bool using_hugepages_ = false; // true if backed by hugetlbfs (Linux bare metal only)
 };

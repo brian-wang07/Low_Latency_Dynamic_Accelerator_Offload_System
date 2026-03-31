@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 
 #include "price_level.hpp"
 

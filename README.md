@@ -165,6 +165,19 @@ Requires C++23, CMake 3.20+, Linux (POSIX shm, `_mm_pause`).
 ---
 
 ## running
+Before running, ensure that hugepages is set up (native Linux only — WSL2 will fall back to POSIX shm with a warning):
+
+```sh
+# allocate hugepages: SHM_SIZE / hugepage size = 16MB / 2MB = 8 pages minimum
+# allocate a few extra to leave headroom for the OS
+echo 10 | sudo tee /proc/sys/vm/nr_hugepages
+
+# mount hugetlbfs so the engine can open a named hugepage-backed file
+sudo mkdir -p /dev/hugepages
+sudo mount -t hugetlbfs -o pagesize=2M hugetlbfs /dev/hugepages
+```
+
+If you change `SHM_SIZE` in `shm_core.hpp`, update `nr_hugepages` accordingly: `ceil(SHM_SIZE / 2MB)`, plus a few spare.
 
 Start processes in order (each opens shm after the previous creates it):
 

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 
 // Cross-platform timestamp counter read.
 // x86/x64: __rdtsc() via intrinsic
