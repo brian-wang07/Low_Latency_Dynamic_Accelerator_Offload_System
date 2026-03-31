@@ -1,9 +1,10 @@
 #include <iostream>
-#include <sys/mman.h> //shm 
 #include <sys/stat.h> //mode constants
 #include <fcntl.h>    //O_* constants
 #include <unistd.h>
 #include <cstring>
+#include <sys/mman.h>
+
 
 #include "shm_manager.hpp"
 #include "shm_types.hpp"
@@ -17,6 +18,10 @@ bool ShmManager::create() {
 
   //initialize a new virtual memory block; creates the object with read/write access if it doesnt exist and fails if it does.
   //the object must be exclusive as well. owner has read and write permissions, group and other has read only.  
+  // ensure that vm.nr_hugepages = 16; 
+  // Linux: $echo 16 | sudo tee /proc/sys/vm/nr_hugepages
+  // MacOS: check sysctl -a | grep kern.sysv.shm, make sure that kern.sysv.shmmax > 32 MB. if not, 
+  // $sudo sysctl -w kern.sysv.shmmax = 16777216
   fd_ = shm_open(name_.c_str(), O_CREAT | O_RDWR | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
   if (fd_ == -1) {
     //returns -1 on error
@@ -32,7 +37,12 @@ bool ShmManager::create() {
   }
 
   //map p to the memory block. set addr as nullptr, to let kernel figure out location. 
+#ifdef __linux__
+  void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd_, 0);
+#else
   void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+#endif
+
   if (p == MAP_FAILED) {
     ::close(fd_);
 
@@ -62,7 +72,11 @@ bool ShmManager::open() {
     return false;
   }
 
+#ifdef __linux__
+  void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB | MAP_HUGE_2MB, fd_, 0);
+#else
   void *p = mmap(nullptr, common::shm::SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+#endif
   if (p == MAP_FAILED) {
     ::close(fd_);
     fd_ = -1;
